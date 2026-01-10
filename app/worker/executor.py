@@ -29,7 +29,11 @@ def execute_task(task_id: int) -> None:
         db.execute(
             update(Task)
             .where(Task.id == task_id)
-            .values(status=TaskStatus.processing, updated_at=datetime.now(UTC), error_message=None)
+            .values(
+                status=TaskStatus.processing,
+                updated_at=datetime.now(UTC),
+                error_message=None,
+            )
         )
         db.commit()
 
@@ -48,13 +52,27 @@ def execute_task(task_id: int) -> None:
             filename, content = tg_download_file(settings.BOT_TOKEN, task.input_tg_file_id)
             mime = _guess_mime(filename)
 
-        # готовим multipart
-        files = {}
-        if preset.input_kind != "none":
-            files = {preset.input_field: (filename, content, mime)}
+        # ---- build params/files ----
+        params: dict = dict(preset.params or {})
+        files = None
 
-        # --- submit ---
+        # Smart prompt mode for outpainting:
+        # - preset.params["prompt"] is a master prompt
+        # - task.input_text is user's extra instruction
+        if preset.slug == "outpainting":
+            user_text = (task.input_text or "").strip()
+            base_prompt = (params.get("prompt") or "").strip()
+            if user_text:
+                if base_prompt:
+                    params["prompt"] = f"{base_prompt}\nUser request: {user_text}"
+                else:
+                    params["prompt"] = user_text
+
         if preset.provider_target == "function":
+            if preset.input_kind != "none":
+                files = {preset.input_field: (filename, content, mime)}
+
+            # Special case kept: analyze-call (audio + script)
             if preset.slug == "analyze-call":
                 request_id = gen.submit_function(
                     function_id="analyze-call",
@@ -70,36 +88,53 @@ def execute_task(task_id: int) -> None:
                     function_id=preset.provider_id,
                     implementation=preset.implementation or "default",
                     files=files,
-                    params=preset.params,
+                    params=params,
                 )
 
         elif preset.provider_target == "network":
+            if preset.input_kind == "none":
+                raise RuntimeError("Network preset requires input file.")
+
+            # For networks we always provide a public URL in params[preset.input_field]
+            ext = ".bin"
+            low = (filename or "").lower()
+            for e in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
+                if low.endswith(e):
+                    ext = e
+                    break
+
+            input_key = f"uploads/task_{task_id}_{preset.slug}{ext}"
+            save_bytes(input_key, content)
+
+            public_base = settings.API_PUBLIC_BASE_URL.rstrip("/")
+            params[preset.input_field] = f"{public_base}/files/{input_key}"
+
             request_id = gen.submit_network(
                 network_id=preset.provider_id,
-                files=files,
-                params=preset.params,
+                files=None,
+                params=params,
             )
 
         else:
             raise RuntimeError(f"Unsupported provider_target={preset.provider_target}")
 
-        # --- poll ---
+        # ---- poll ----
         result = gen.poll(request_id, timeout_sec=600)
         if result.status != "success":
             raise RuntimeError(f"GenAPI failed: {result.payload}")
 
-        # --- store result ---
+        # ---- store result ----
         if result.file_url:
-            with httpx.Client(timeout=httpx.Timeout(300.0, connect=30.0)) as client:
+            # Streaming download to avoid timeouts on large files
+            with httpx.Client(timeout=httpx.Timeout(300.0, connect=30.0), trust_env=False) as client:
                 with client.stream("GET", result.file_url) as r:
                     r.raise_for_status()
                     out_bytes = b"".join(chunk for chunk in r.iter_bytes())
 
-
-            low = result.file_url.lower()
+            low_url = (result.file_url or "").lower()
             ext = ".bin"
             for e in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".mp4", ".mov", ".glb", ".obj", ".txt", ".json"):
-                if e in low:
+                if e in low_url:
                     ext = e
                     break
 
@@ -135,7 +170,11 @@ def execute_task(task_id: int) -> None:
         db.execute(
             update(Task)
             .where(Task.id == task_id)
-            .values(status=TaskStatus.failed, error_message=str(e), updated_at=datetime.now(UTC))
+            .values(
+                status=TaskStatus.failed,
+                error_message=str(e),
+                updated_at=datetime.now(UTC),
+            )
         )
         db.commit()
     finally:
