@@ -80,7 +80,7 @@ def kb_bottom_panel() -> ReplyKeyboardMarkup:
 def kb_tools_inline():
     kb = InlineKeyboardBuilder()
     kb.button(text="🎧 Анализ звонка", callback_data="set:analyze-call")
-    kb.button(text="🖼 Outpaint / Reframe", callback_data="set:image-reframe")
+    kb.button(text="🖼 Outpaint / Reframe", callback_data="set:outpainting")
     kb.button(text="🔼 Upscale (SeedVR)", callback_data="set:seedvr")
     kb.button(text="🧾 Картинка → SVG", callback_data="set:image-2-svg")
     kb.button(text="🧊 3D (выбор качества)", callback_data="menu:3d")
