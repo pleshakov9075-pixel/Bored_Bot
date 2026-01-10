@@ -7,6 +7,7 @@ class Settings(BaseSettings):
 
     # API
     API_BASE_URL: str = "http://localhost:8080"
+    API_PUBLIC_BASE_URL=http://89.104.69.156:8000
     INTERNAL_API_KEY: str = "dev-internal-key"
 
     # --- GenAPI ---

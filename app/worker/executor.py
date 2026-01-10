@@ -24,17 +24,21 @@ def execute_task(task_id: int) -> None:
     db = SessionLocal()
     try:
         task = db.execute(select(Task).where(Task.id == task_id)).scalar_one()
-        preset = get_preset((task.preset_slug or "").strip().lower())
+        preset = get_preset(task.preset_slug)
 
         db.execute(
             update(Task)
             .where(Task.id == task_id)
-            .values(status=TaskStatus.processing, updated_at=datetime.now(UTC), error_message=None)
+            .values(
+                status=TaskStatus.processing,
+                updated_at=datetime.now(UTC),
+                error_message=None,
+            )
         )
         db.commit()
 
         if not settings.GENAPI_TOKEN:
-            raise RuntimeError("GENAPI_TOKEN is empty in .env")
+            raise RuntimeError("GENAPI_TOKEN is empty")
 
         gen = GenApiClient(settings.GENAPI_BASE_URL, settings.GENAPI_TOKEN)
 
@@ -44,40 +48,49 @@ def execute_task(task_id: int) -> None:
 
         if preset.input_kind != "none":
             if not task.input_tg_file_id:
-                raise RuntimeError("No input file. Send image/audio file.")
-            filename, content = tg_download_file(settings.BOT_TOKEN, task.input_tg_file_id)
+                raise RuntimeError("No input file")
+            filename, content = tg_download_file(
+                settings.BOT_TOKEN, task.input_tg_file_id
+            )
             mime = _guess_mime(filename)
 
-        # готовим multipart
-        files = {}
-        if preset.input_kind != "none":
-            files = {preset.input_field: (filename, content, mime)}
+        files = None
+        params = dict(preset.params or {})
 
-        # --- submit ---
+        # --- FUNCTION: всегда multipart ---
         if preset.provider_target == "function":
-            if preset.slug == "analyze-call":
-                request_id = gen.submit_function(
-                    function_id="analyze-call",
-                    implementation="claude",
-                    files={"audio": (filename, content, mime)},
-                    params={
-                        "model": "claude-3-7-sonnet-20250219",
-                        "script": task.input_text or None,
-                    },
-                )
-            else:
-                request_id = gen.submit_function(
-                    function_id=preset.provider_id,
-                    implementation=preset.implementation or "default",
-                    files=files,
-                    params=preset.params,
-                )
+            if preset.input_kind != "none":
+                files = {preset.input_field: (filename, content, mime)}
 
+            request_id = gen.submit_function(
+                function_id=preset.provider_id,
+                implementation=preset.implementation or "default",
+                files=files,
+                params=params,
+            )
+
+        # --- NETWORK: всегда URL ---
         elif preset.provider_target == "network":
+            if preset.input_kind == "none":
+                raise RuntimeError("Network requires input file")
+
+            ext = ".bin"
+            low = (filename or "").lower()
+            for e in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
+                if low.endswith(e):
+                    ext = e
+                    break
+
+            key = f"uploads/task_{task_id}_{preset.slug}{ext}"
+            save_bytes(key, content)
+
+            base = settings.API_PUBLIC_BASE_URL.rstrip("/")
+            params[preset.input_field] = f"{base}/files/{key}"
+
             request_id = gen.submit_network(
                 network_id=preset.provider_id,
-                files=files,
-                params=preset.params,
+                files=None,
+                params=params,
             )
 
         else:
@@ -88,21 +101,14 @@ def execute_task(task_id: int) -> None:
         if result.status != "success":
             raise RuntimeError(f"GenAPI failed: {result.payload}")
 
-        # --- store result ---
+        # --- save result ---
         if result.file_url:
-            with httpx.Client(timeout=180, trust_env=False) as client:
+            with httpx.Client(timeout=180) as client:
                 r = client.get(result.file_url)
                 r.raise_for_status()
                 out_bytes = r.content
 
-            low = result.file_url.lower()
-            ext = ".bin"
-            for e in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".mp4", ".mov", ".glb", ".obj", ".txt", ".json"):
-                if e in low:
-                    ext = e
-                    break
-
-            key = f"results/task_{task_id}_{preset.slug}{ext}"
+            key = f"results/task_{task_id}_{preset.slug}"
             save_bytes(key, out_bytes)
 
             db.execute(
@@ -115,26 +121,29 @@ def execute_task(task_id: int) -> None:
                     updated_at=datetime.now(UTC),
                 )
             )
-            db.commit()
         else:
             db.execute(
                 update(Task)
                 .where(Task.id == task_id)
                 .values(
                     status=TaskStatus.success,
-                    result_file_key=None,
                     result_text=result.text or "Готово ✅",
                     updated_at=datetime.now(UTC),
                 )
             )
-            db.commit()
+
+        db.commit()
 
     except Exception as e:
         db.rollback()
         db.execute(
             update(Task)
             .where(Task.id == task_id)
-            .values(status=TaskStatus.failed, error_message=str(e), updated_at=datetime.now(UTC))
+            .values(
+                status=TaskStatus.failed,
+                error_message=str(e),
+                updated_at=datetime.now(UTC),
+            )
         )
         db.commit()
     finally:
