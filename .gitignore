@@ -1,0 +1,22 @@
+﻿# Python
+__pycache__/
+*.pyc
+
+# Virtual env
+.venv/
+venv/
+
+# Env
+.env
+
+# Data
+data/genbot.db
+data/files/results/
+data/files/uploads/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
