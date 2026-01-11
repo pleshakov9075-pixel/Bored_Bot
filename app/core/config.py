@@ -8,14 +8,14 @@ class Settings(BaseSettings):
     # API
     API_BASE_URL: str = "http://localhost:8080"
     # публичная база (то, что доступно GenAPI извне)
-    API_PUBLIC_BASE_URL: str = "http://89.104.69.156:8000"
+    API_PUBLIC_BASE_URL: str = "http://localhost:8000"
     PUBLIC_FILES_BASE_URL: str = ""
 
-    INTERNAL_API_KEY: str = "dev-internal-key"
+    INTERNAL_API_KEY: str = ""
 
     # --- GenAPI ---
     GENAPI_BASE_URL: str = "https://api.gen-api.ru/api/v1"
-    GENAPI_TOKEN: str = "sk-1xGvNoyLmRsfDfnglaPKdPvfcp5xPX0mM2lkiNJDfXGThQxdPgeeahUUriEU"
+    GENAPI_TOKEN: str = ""
 
     # Limits
     MAX_INPUT_FILES: int = 2
@@ -32,8 +32,8 @@ class Settings(BaseSettings):
 
     # MinIO (на будущее)
     MINIO_ENDPOINT: str = "localhost:9000"
-    MINIO_ACCESS_KEY: str = "minio"
-    MINIO_SECRET_KEY: str = "minio12345"
+    MINIO_ACCESS_KEY: str = ""
+    MINIO_SECRET_KEY: str = ""
     MINIO_BUCKET: str = "genbot"
     MINIO_SECURE: bool = False
 
