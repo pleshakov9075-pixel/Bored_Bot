@@ -36,3 +36,21 @@ class ApiClient:
             if r.status_code >= 400:
                 raise RuntimeError(f"API error {r.status_code}: {r.text}")
             return r.content
+
+    async def get_balance(self, tg_user_id: int) -> dict:
+        async with httpx.AsyncClient(timeout=30, trust_env=False) as client:
+            r = await client.get(f"{self.base}/internal/balance/{tg_user_id}", headers=self.headers)
+            if r.status_code >= 400:
+                raise RuntimeError(f"API error {r.status_code}: {r.text}")
+            return r.json()
+
+    async def create_topup(self, tg_user_id: int, amount_rub: int, description: str = "Пополнение баланса"):
+        async with httpx.AsyncClient(timeout=30, trust_env=False) as client:
+            r = await client.post(
+                f"{self.base}/internal/payments/topup",
+                headers=self.headers,
+                json={"tg_user_id": tg_user_id, "amount_rub": amount_rub, "description": description},
+            )
+            if r.status_code >= 400:
+                raise RuntimeError(f"API error {r.status_code}: {r.text}")
+            return r.json()

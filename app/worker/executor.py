@@ -3,6 +3,8 @@
 from datetime import datetime, UTC
 import mimetypes
 import json
+import time
+import random
 
 import httpx
 from sqlalchemy import select, update
@@ -27,8 +29,6 @@ def _parse_text_and_meta(input_text: str | None) -> tuple[str, dict]:
       <prompt text>
       ---
       {json meta}
-
-    Для Suno можно отправлять только meta (prompt_text будет пустой).
     """
     if not input_text:
         return "", {}
@@ -58,6 +58,31 @@ def _ext_from_filename(filename: str | None) -> str:
         if low.endswith(e):
             return e
     return ".bin"
+
+
+def _download_with_retry(url: str, timeout_total: float = 300.0) -> bytes:
+    deadline = time.time() + timeout_total
+    delay = 1.0
+
+    with httpx.Client(timeout=httpx.Timeout(60.0, connect=30.0), trust_env=False, follow_redirects=True) as client:
+        while True:
+            try:
+                r = client.get(url)
+                if r.status_code in (500, 502, 503, 504, 429):
+                    if time.time() > deadline:
+                        raise RuntimeError(f"Download failed by deadline: HTTP {r.status_code} {r.text[:200]}")
+                    time.sleep(delay * (0.85 + random.random() * 0.3))
+                    delay = min(delay * 1.6, 8.0)
+                    continue
+
+                r.raise_for_status()
+                return r.content
+
+            except (httpx.TimeoutException, httpx.NetworkError) as e:
+                if time.time() > deadline:
+                    raise RuntimeError(f"Download failed by deadline: {e}") from e
+                time.sleep(delay * (0.85 + random.random() * 0.3))
+                delay = min(delay * 1.6, 8.0)
 
 
 def execute_task(task_id: int) -> None:
@@ -106,8 +131,8 @@ def execute_task(task_id: int) -> None:
             if not user_prompt:
                 raise RuntimeError("Grok requires prompt text")
 
-            messages = [{"role": "user", "content": user_prompt}]
-            params["messages"] = json.dumps(messages, ensure_ascii=False)
+            # ✅ ВАЖНО: messages должен быть списком/объектом, а не JSON-строкой
+            params["messages"] = [{"role": "user", "content": user_prompt}]
             params.setdefault("model", "grok-4-1-fast-reasoning")
             params.setdefault("stream", False)
 
@@ -116,7 +141,6 @@ def execute_task(task_id: int) -> None:
             if prompt_text:
                 params["prompt"] = prompt_text
 
-            # всегда выключаем автоперевод
             params["translate_input"] = False
 
             allowed = {
@@ -127,14 +151,13 @@ def execute_task(task_id: int) -> None:
                 "num_images",
                 "output_format",
                 "translate_input",
-                "tg_file_ids",  # служебное поле для multi-image
-                "title", "tags", "prompt", "model", "messages", "stream"  # безопасно для универсальности
+                "tg_file_ids",
             }
             for k, v in (meta or {}).items():
                 if k in allowed and v is not None:
                     params[k] = v
 
-        # ---- download single file if needed by functions OR by networks w/ img2img ----
+        # ---- download single file if needed by functions ----
         filename = content = mime = None
         if preset.provider_target == "function" and preset.input_kind != "none":
             if not task.input_tg_file_id:
@@ -148,28 +171,14 @@ def execute_task(task_id: int) -> None:
             if preset.input_kind != "none":
                 files = {preset.input_field: (filename, content, mime)}
 
-            if preset.slug == "analyze-call":
-                request_id = gen.submit_function(
-                    function_id="analyze-call",
-                    implementation="claude",
-                    files={"audio": (filename, content, mime)},
-                    params={
-                        "model": "claude-3-7-sonnet-20250219",
-                        "script": task.input_text or None,
-                    },
-                )
-            else:
-                request_id = gen.submit_function(
-                    function_id=preset.provider_id,
-                    implementation=preset.implementation or "default",
-                    files=files,
-                    params=params,
-                )
+            request_id = gen.submit_function(
+                function_id=preset.provider_id,
+                implementation=preset.implementation or "default",
+                files=files or {},
+                params=params,
+            )
 
         elif preset.provider_target == "network":
-            # network:
-            # - text2img: input_kind == "none" -> only params
-            # - img2img: input_kind == "image" -> 1 or 2 images
             if preset.input_kind != "none":
                 # 1) collect tg file ids from meta (preferred)
                 tg_file_ids: list[str] = []
@@ -177,13 +186,11 @@ def execute_task(task_id: int) -> None:
                 if isinstance(v, list):
                     tg_file_ids = [str(x) for x in v if x]
 
-                # fallback to task.input_tg_file_id
                 if not tg_file_ids:
                     if not task.input_tg_file_id:
                         raise RuntimeError("No input file. Send image file.")
                     tg_file_ids = [task.input_tg_file_id]
 
-                # 2) download each file and create public urls
                 public_base = str(settings.API_PUBLIC_BASE_URL).rstrip("/")
                 urls: list[str] = []
                 for idx, fid in enumerate(tg_file_ids, start=1):
@@ -191,26 +198,24 @@ def execute_task(task_id: int) -> None:
                     ext = _ext_from_filename(fn)
                     input_key = f"uploads/task_{task_id}_{preset.slug}_{idx}{ext}"
                     save_bytes(input_key, body)
+                    # ✅ теперь /files реально существует в API
                     urls.append(f"{public_base}/files/{input_key}")
 
-                # 3) inject into params: multi-image for nano uses image_urls
                 if preset.input_field == "image_urls":
                     params["image_urls"] = urls
                 else:
                     params[preset.input_field] = urls[0]
-    
-            # DEBUG
-            print(f"[task {task_id}] preset={preset.slug} network={preset.provider_id} params={params}")
 
             # FORCE translate_input BOOL
             params["translate_input"] = False
+
+            print(f"[task {task_id}] preset={preset.slug} network={preset.provider_id} params={params}")
 
             request_id = gen.submit_network(
                 network_id=preset.provider_id,
                 files=None,
                 params=params,
             )
-
 
         else:
             raise RuntimeError(f"Unsupported provider_target={preset.provider_target}")
@@ -222,10 +227,7 @@ def execute_task(task_id: int) -> None:
 
         # ---- store result ----
         if result.file_url:
-            with httpx.Client(timeout=httpx.Timeout(300.0, connect=30.0), trust_env=False) as client:
-                with client.stream("GET", result.file_url) as r:
-                    r.raise_for_status()
-                    out_bytes = b"".join(chunk for chunk in r.iter_bytes())
+            out_bytes = _download_with_retry(result.file_url, timeout_total=300.0)
 
             low_url = (result.file_url or "").lower()
             ext = ".bin"

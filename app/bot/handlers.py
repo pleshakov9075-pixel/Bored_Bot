@@ -112,6 +112,18 @@ def load_image_presets() -> list[dict]:
 
 
 # -----------------------
+# Keyboards: Balance / Payments
+# -----------------------
+def kb_payments():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="💳 Пополнить 99 ₽", callback_data="pay:topup:99")
+    kb.button(text="💳 Пополнить 299 ₽", callback_data="pay:topup:299")
+    kb.button(text="💳 Пополнить 999 ₽", callback_data="pay:topup:999")
+    kb.adjust(1, 1, 1)
+    return kb.as_markup()
+
+
+# -----------------------
 # Keyboards: Images
 # -----------------------
 def kb_img_action():
@@ -358,8 +370,48 @@ async def grok_menu(message: Message):
 
 
 @router.message(F.text == "👛 Баланс")
-async def balance_stub(message: Message):
-    await message.answer("👛 Баланс подключим позже.", reply_markup=kb_bottom_panel())
+async def balance(message: Message):
+    api = ApiClient()
+    b = await api.get_balance(message.from_user.id)
+    await message.answer(
+        f"👛 Баланс: {b['credits']} кредит(ов)\n\n"
+        "Пополнение подключено через YooKassa (тест).",
+        reply_markup=kb_bottom_panel(),
+    )
+    await message.answer("Выбери сумму пополнения:", reply_markup=kb_payments())
+
+
+# -----------------------
+# Payments callbacks
+# -----------------------
+@router.callback_query(F.data.startswith("pay:topup:"))
+async def cb_topup(cb: CallbackQuery):
+    uid = cb.from_user.id
+    try:
+        amount = int(cb.data.split(":")[-1])
+    except Exception:
+        await cb.answer("Некорректная сумма", show_alert=True)
+        return
+
+    api = ApiClient()
+    try:
+        resp = await api.create_topup(uid, amount_rub=amount, description="Пополнение кредитов GenBot")
+        url = resp.get("confirmation_url")
+        if not url:
+            await cb.answer("Не удалось получить ссылку на оплату", show_alert=True)
+            return
+
+        # Telegram clickable link
+        await cb.message.answer(
+            f"💳 Оплата на {amount} ₽\n\n"
+            f"Перейди по ссылке и оплати:\n{url}\n\n"
+            "После оплаты начисление кредитов подключим через вебхук YooKassa.",
+            reply_markup=kb_bottom_panel(),
+        )
+        await cb.answer("Ссылка готова ✅")
+    except Exception as e:
+        await cb.answer("Ошибка создания платежа", show_alert=True)
+        await cb.message.answer(f"❌ Не смог создать платеж: {e}", reply_markup=kb_bottom_panel())
 
 
 # -----------------------
