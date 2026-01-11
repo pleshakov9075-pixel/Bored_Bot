@@ -22,6 +22,12 @@ from app.bot.polling import wait_task_done
 router = Router()
 
 MAX_TG_TEXT = 3500
+PAYMENTS_DISABLED = True
+
+PAYMENTS_DISABLED_MESSAGE = (
+    "⚠️ Оплаты YooKassa временно отключены до прохождения модерации.\n"
+    "Пополнение баланса будет доступно позже."
+)
 
 # Global runtime state
 USER_MODE: dict[int, str] = {}               # preset_slug
@@ -420,6 +426,12 @@ async def grok_menu(message: Message):
 async def balance(message: Message):
     api = ApiClient()
     b = await api.get_balance(message.from_user.id)
+    if PAYMENTS_DISABLED:
+        await message.answer(
+            f"👛 Баланс: {b['credits']} кредит(ов)\n\n{PAYMENTS_DISABLED_MESSAGE}",
+            reply_markup=kb_bottom_panel(),
+        )
+        return
     await message.answer(
         f"👛 Баланс: {b['credits']} кредит(ов)\n\nВыбери сумму пополнения:",
         reply_markup=kb_payments(),
@@ -428,6 +440,10 @@ async def balance(message: Message):
 
 @router.callback_query(F.data == "pay:topup:custom")
 async def cb_pay_custom(cb: CallbackQuery):
+    if PAYMENTS_DISABLED:
+        await cb.message.answer(PAYMENTS_DISABLED_MESSAGE, reply_markup=kb_bottom_panel())
+        await cb.answer("Оплаты временно отключены", show_alert=True)
+        return
     uid = cb.from_user.id
     USER_PAY_FLOW[uid] = {"step": "amount"}
     await cb.message.answer(
@@ -442,6 +458,10 @@ async def cb_pay_custom(cb: CallbackQuery):
 
 @router.callback_query(F.data.startswith("pay:topup:") & ~F.data.endswith(":custom"))
 async def cb_topup(cb: CallbackQuery):
+    if PAYMENTS_DISABLED:
+        await cb.message.answer(PAYMENTS_DISABLED_MESSAGE, reply_markup=kb_bottom_panel())
+        await cb.answer("Оплаты временно отключены", show_alert=True)
+        return
     uid = cb.from_user.id
     try:
         amount = int(cb.data.split(":")[-1])
