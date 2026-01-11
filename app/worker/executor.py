@@ -198,12 +198,19 @@ def execute_task(task_id: int) -> None:
                     params["image_urls"] = urls
                 else:
                     params[preset.input_field] = urls[0]
+    
+            # DEBUG
+            print(f"[task {task_id}] preset={preset.slug} network={preset.provider_id} params={params}")
+
+            # FORCE translate_input BOOL
+            params["translate_input"] = False
 
             request_id = gen.submit_network(
                 network_id=preset.provider_id,
                 files=None,
                 params=params,
             )
+
 
         else:
             raise RuntimeError(f"Unsupported provider_target={preset.provider_target}")
