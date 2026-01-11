@@ -23,10 +23,12 @@ def _guess_mime(filename: str) -> str:
 
 def _parse_text_and_meta(input_text: str | None) -> tuple[str, dict]:
     """
-    Формат input_text:
+    Формат:
       <prompt text>
       ---
-      { "aspect_ratio": "1:1", "image_size": "1024x1024", "tg_file_ids": ["..",".."] }
+      {json meta}
+
+    Для Suno можно отправлять только meta (prompt_text будет пустой).
     """
     if not input_text:
         return "", {}
@@ -81,18 +83,35 @@ def execute_task(task_id: int) -> None:
         gen = GenApiClient(settings.GENAPI_BASE_URL, settings.GENAPI_TOKEN)
 
         params: dict = dict(preset.params or {})
-        files = None
-
         prompt_text, meta = _parse_text_and_meta(task.input_text)
 
-        # --- outpainting smart prompt (как было) ---
-        if preset.slug == "outpainting":
-            user_text = (task.input_text or "").strip()
-            base_prompt = (params.get("prompt") or "").strip()
-            if user_text:
-                params["prompt"] = f"{base_prompt}\nUser request: {user_text}" if base_prompt else user_text
+        # ---- Special: Suno (network) ----
+        if preset.slug == "suno":
+            title = (meta.get("title") or "").strip()
+            tags = (meta.get("tags") or "").strip()
+            prompt = (meta.get("prompt") or prompt_text or "").strip()
 
-        # --- image presets: img_* ---
+            if not title or not tags or not prompt:
+                raise RuntimeError("Suno requires title, tags, prompt")
+
+            params["title"] = title
+            params["tags"] = tags
+            params["prompt"] = prompt
+            params["model"] = "v5"
+            params["translate_input"] = False
+
+        # ---- Special: Grok (network) ----
+        if preset.slug == "grok":
+            user_prompt = (prompt_text or "").strip()
+            if not user_prompt:
+                raise RuntimeError("Grok requires prompt text")
+
+            messages = [{"role": "user", "content": user_prompt}]
+            params["messages"] = json.dumps(messages, ensure_ascii=False)
+            params.setdefault("model", "grok-4-1-fast-reasoning")
+            params.setdefault("stream", False)
+
+        # ---- Image presets: img_* ----
         if preset.slug.startswith("img_"):
             if prompt_text:
                 params["prompt"] = prompt_text
@@ -108,20 +127,25 @@ def execute_task(task_id: int) -> None:
                 "num_images",
                 "output_format",
                 "translate_input",
-                "tg_file_ids",  # наше служебное поле
+                "tg_file_ids",  # служебное поле для multi-image
+                "title", "tags", "prompt", "model", "messages", "stream"  # безопасно для универсальности
             }
             for k, v in (meta or {}).items():
                 if k in allowed and v is not None:
                     params[k] = v
 
+        # ---- download single file if needed by functions OR by networks w/ img2img ----
+        filename = content = mime = None
+        if preset.provider_target == "function" and preset.input_kind != "none":
+            if not task.input_tg_file_id:
+                raise RuntimeError("No input file. Send image/audio file.")
+            filename, content = tg_download_file(settings.BOT_TOKEN, task.input_tg_file_id)
+            mime = _guess_mime(filename)
+
+        # ---- run ----
         if preset.provider_target == "function":
-            # функции у тебя только с одним файлом (ок)
-            filename = content = mime = None
+            files = None
             if preset.input_kind != "none":
-                if not task.input_tg_file_id:
-                    raise RuntimeError("No input file. Send image/audio file.")
-                filename, content = tg_download_file(settings.BOT_TOKEN, task.input_tg_file_id)
-                mime = _guess_mime(filename)
                 files = {preset.input_field: (filename, content, mime)}
 
             if preset.slug == "analyze-call":
@@ -143,41 +167,36 @@ def execute_task(task_id: int) -> None:
                 )
 
         elif preset.provider_target == "network":
-            # network может быть:
-            # - text2img: input_kind == "none" -> просто params
-            # - img2img: input_kind == "image" -> нужны 1 или 2 изображения
-
+            # network:
+            # - text2img: input_kind == "none" -> only params
+            # - img2img: input_kind == "image" -> 1 or 2 images
             if preset.input_kind != "none":
-                # 1) вытаскиваем список file_id
-                tg_file_ids = []
-                if isinstance(meta, dict):
-                    v = meta.get("tg_file_ids")
-                    if isinstance(v, list):
-                        tg_file_ids = [str(x) for x in v if x]
+                # 1) collect tg file ids from meta (preferred)
+                tg_file_ids: list[str] = []
+                v = (meta or {}).get("tg_file_ids")
+                if isinstance(v, list):
+                    tg_file_ids = [str(x) for x in v if x]
 
+                # fallback to task.input_tg_file_id
                 if not tg_file_ids:
-                    # fallback на один file_id из Task
                     if not task.input_tg_file_id:
                         raise RuntimeError("No input file. Send image file.")
                     tg_file_ids = [task.input_tg_file_id]
 
-                # 2) скачиваем каждый файл и делаем публичный URL
+                # 2) download each file and create public urls
                 public_base = str(settings.API_PUBLIC_BASE_URL).rstrip("/")
                 urls: list[str] = []
-
                 for idx, fid in enumerate(tg_file_ids, start=1):
-                    fn, content = tg_download_file(settings.BOT_TOKEN, fid)
+                    fn, body = tg_download_file(settings.BOT_TOKEN, fid)
                     ext = _ext_from_filename(fn)
                     input_key = f"uploads/task_{task_id}_{preset.slug}_{idx}{ext}"
-                    save_bytes(input_key, content)
+                    save_bytes(input_key, body)
                     urls.append(f"{public_base}/files/{input_key}")
 
-                # 3) кладём в params правильным ключом
-                # Nano Banana/Pro в GenAPI используют image_urls (мульти-инпут). :contentReference[oaicite:1]{index=1}
+                # 3) inject into params: multi-image for nano uses image_urls
                 if preset.input_field == "image_urls":
                     params["image_urls"] = urls
                 else:
-                    # общий случай: 1 url
                     params[preset.input_field] = urls[0]
 
             request_id = gen.submit_network(
@@ -203,7 +222,7 @@ def execute_task(task_id: int) -> None:
 
             low_url = (result.file_url or "").lower()
             ext = ".bin"
-            for e in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".mp4", ".mov", ".glb", ".obj", ".txt", ".json"):
+            for e in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".mp4", ".mov", ".mp3", ".wav", ".glb", ".obj", ".txt", ".json"):
                 if e in low_url:
                     ext = e
                     break

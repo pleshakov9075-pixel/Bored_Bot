@@ -13,27 +13,32 @@ from aiogram.types import (
 )
 from aiogram.types.input_file import BufferedInputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 
 from app.bot.api_client import ApiClient
 from app.bot.polling import wait_task_done
-from app.presets.registry import get_preset
 
 router = Router()
 
 MAX_TG_TEXT = 3500
 
-# Runtime state
-USER_MODE: dict[int, str] = {}            # preset_slug selected
-USER_PENDING_TEXT: dict[int, str] = {}    # prompt (preset prompt + user details)
-USER_PENDING_FILES: dict[int, list[str]] = {}  # list of tg file_id (1-2 photos)
-USER_IMAGE_FLOW: dict[int, dict] = {}     # flow state + meta
+# Global runtime state
+USER_MODE: dict[int, str] = {}               # preset_slug
+USER_PENDING_TEXT: dict[int, str] = {}       # prompt (preset + details)
+USER_PENDING_FILES: dict[int, list[str]] = {}  # photo file_ids (1-2)
 
-# Album buffers (Telegram sends album as multiple messages with same media_group_id)
-ALBUM_PHOTOS: dict[tuple[int, str], list[str]] = {}     # (user_id, media_group_id) -> [file_id...]
-ALBUM_TASKS: dict[tuple[int, str], asyncio.Task] = {}   # finalize timers
+USER_IMAGE_FLOW: dict[int, dict] = {}        # images flow: step/meta/action/engine/tier/...
+USER_SUNO_FLOW: dict[int, dict] = {}         # suno flow: title->tags->prompt
+USER_GROK_FLOW: dict[int, dict] = {}         # grok flow: prompt
+
+# Album buffers
+ALBUM_PHOTOS: dict[tuple[int, str], list[str]] = {}
+ALBUM_TASKS: dict[tuple[int, str], asyncio.Task] = {}
 
 
+# -----------------------
+# Utils
+# -----------------------
 def _truncate(text: str, limit: int = MAX_TG_TEXT) -> str:
     if text is None:
         return ""
@@ -43,10 +48,36 @@ def _truncate(text: str, limit: int = MAX_TG_TEXT) -> str:
     return text[: limit - 50] + "\n\n…(обрезано)…"
 
 
+def _split_chunks(text: str, limit: int = MAX_TG_TEXT) -> list[str]:
+    """
+    Режем длинный текст на куски <= limit.
+    Стараемся резать по переносам строк, чтобы было читаемо.
+    """
+    text = str(text or "")
+    if len(text) <= limit:
+        return [text]
+
+    chunks = []
+    s = text
+    while len(s) > limit:
+        cut = s.rfind("\n", 0, limit)
+        if cut < max(500, limit // 3):
+            cut = limit
+        chunks.append(s[:cut].rstrip())
+        s = s[cut:].lstrip()
+    if s:
+        chunks.append(s)
+    return chunks
+
+
 async def safe_edit_text(msg: Message, text: str, reply_markup=None):
     text = _truncate(text)
     try:
         await msg.edit_text(text, reply_markup=reply_markup)
+    except TelegramNetworkError:
+        # сеть/таймаут — просто отправим новое сообщение
+        await msg.answer(text, reply_markup=reply_markup)
+        return
     except TelegramBadRequest as e:
         s = str(e).lower()
         if "message is not modified" in s:
@@ -64,7 +95,7 @@ def kb_bottom_panel() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🖼 Изображения")],
-            [KeyboardButton(text="🔊 Аудио"), KeyboardButton(text="✍️ Тексты")],
+            [KeyboardButton(text="🎵 Музыка"), KeyboardButton(text="✍️ Текст")],
             [KeyboardButton(text="👛 Баланс")],
         ],
         resize_keyboard=True,
@@ -73,7 +104,6 @@ def kb_bottom_panel() -> ReplyKeyboardMarkup:
 
 
 def load_image_presets() -> list[dict]:
-    # app/bot/image_presets.json
     p = Path(__file__).resolve().parent / "image_presets.json"
     if not p.exists():
         return []
@@ -82,11 +112,11 @@ def load_image_presets() -> list[dict]:
 
 
 # -----------------------
-# Keyboards
+# Keyboards: Images
 # -----------------------
 def kb_img_action():
     kb = InlineKeyboardBuilder()
-    kb.button(text="✨ Увеличить качество (SeedVR)", callback_data="img:action:upscale")
+    kb.button(text="✨ Upscale (SeedVR)", callback_data="img:action:upscale")
     kb.button(text="🧠 Создать по тексту", callback_data="img:action:create")
     kb.button(text="🪄 Редактировать фото", callback_data="img:action:edit")
     kb.adjust(1)
@@ -111,25 +141,12 @@ def kb_img_tier():
     return kb.as_markup()
 
 
-def kb_img_ar():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="default", callback_data="img:ar:default")
-    kb.button(text="1:1", callback_data="img:ar:1_1")
-    kb.button(text="4:3", callback_data="img:ar:4_3")
-    kb.button(text="3:4", callback_data="img:ar:3_4")
-    kb.button(text="3:2", callback_data="img:ar:3_2")
-    kb.button(text="2:3", callback_data="img:ar:2_3")
-    kb.button(text="⬅️ Назад", callback_data="img:back:tier")
-    kb.adjust(2, 2, 2, 1)
-    return kb.as_markup()
-
-
-def kb_gpt_image_size():
+def kb_img_size3():
     kb = InlineKeyboardBuilder()
     kb.button(text="1024x1024", callback_data="img:size:1024x1024")
     kb.button(text="1536x1024", callback_data="img:size:1536x1024")
     kb.button(text="1024x1536", callback_data="img:size:1024x1536")
-    kb.button(text="⬅️ Назад", callback_data="img:back:ar")
+    kb.button(text="⬅️ Назад", callback_data="img:back:tier")
     kb.adjust(2, 1, 1)
     return kb.as_markup()
 
@@ -139,8 +156,8 @@ def kb_img_presets():
     kb = InlineKeyboardBuilder()
     for p in presets:
         kb.button(text=p["title"], callback_data=f"img:preset:{p['id']}")
-    kb.button(text="➡️ Пропустить пресет", callback_data="img:preset:skip")
-    kb.button(text="⬅️ Назад", callback_data="img:back:presetprev")
+    kb.button(text="➡️ Без пресета", callback_data="img:preset:skip")
+    kb.button(text="⬅️ Назад", callback_data="img:back:size")
     kb.adjust(2)
     return kb.as_markup()
 
@@ -155,21 +172,22 @@ def kb_seedvr_scale():
 
 
 # -----------------------
-# Helpers
+# Helpers: Images
 # -----------------------
 def _img_flow(uid: int) -> dict:
     return USER_IMAGE_FLOW.setdefault(uid, {"step": "action", "meta": {}})
 
 
-def _reset(uid: int):
+def _reset_all(uid: int):
     USER_MODE.pop(uid, None)
     USER_PENDING_TEXT.pop(uid, None)
     USER_PENDING_FILES.pop(uid, None)
     USER_IMAGE_FLOW.pop(uid, None)
+    USER_SUNO_FLOW.pop(uid, None)
+    USER_GROK_FLOW.pop(uid, None)
 
 
 def _build_slug(flow: dict) -> str:
-    # img_{engine}_{tier}_{action} -> matches registry.py slugs
     return f"img_{flow['engine']}_{flow['tier']}_{flow['action']}"
 
 
@@ -181,28 +199,33 @@ def _set_common_meta(flow: dict):
 
 
 def _tier_apply_defaults(flow: dict):
-    """
-    Standard/Pro переключатель одинаковый для обоих движков:
-    - GPT: quality=medium/high, image_size default
-    - NB: std без quality, pro ставит quality=high, resolution default
-    """
     _set_common_meta(flow)
     meta = flow["meta"]
     engine = flow.get("engine")
     tier = flow.get("tier")
 
     if engine == "gpt":
-        meta["quality"] = "high" if tier == "pro" else "low"
+        # requested: Standard=low, Pro=medium
+        meta["quality"] = "medium" if tier == "pro" else "low"
         meta.setdefault("image_size", "1024x1024")
-        meta.setdefault("aspect_ratio", "default")
 
     if engine == "nb":
         meta.setdefault("resolution", "2K")
-        meta.setdefault("aspect_ratio", "default")
         if tier == "pro":
             meta["quality"] = "high"
         else:
             meta.pop("quality", None)
+
+
+def _size_to_ratio(size: str) -> str:
+    # mapping to help nano: ratio derived from size
+    if size == "1024x1024":
+        return "1:1"
+    if size == "1024x1536":
+        return "2:3"
+    if size == "1536x1024":
+        return "3:2"
+    return "default"
 
 
 def _meta_to_input_text(prompt: str, meta: dict) -> str:
@@ -217,16 +240,11 @@ def _preset_prompt(preset_id: str) -> str:
     return (presets.get(preset_id) or {}).get("prompt", "") or ""
 
 
-def _is_nano_edit(flow: dict) -> bool:
-    return flow.get("action") == "edit" and flow.get("engine") == "nb"
-
-
 def _album_key(uid: int, media_group_id: str) -> tuple[int, str]:
     return (uid, str(media_group_id))
 
 
 async def _finalize_album(uid: int, media_group_id: str, message: Message):
-    # ждём, пока Telegram дошлёт весь альбом (серия сообщений)
     await asyncio.sleep(0.9)
 
     key = _album_key(uid, media_group_id)
@@ -254,6 +272,9 @@ async def _finalize_album(uid: int, media_group_id: str, message: Message):
         await message.answer("2 фото принято ✅ Теперь напиши промпт (что сделать).", reply_markup=kb_bottom_panel())
 
 
+# -----------------------
+# Delivery
+# -----------------------
 async def _run_and_deliver(message: Message, task_id: int):
     api = ApiClient()
     status_msg = await message.answer(
@@ -273,27 +294,67 @@ async def _run_and_deliver(message: Message, task_id: int):
             await safe_edit_text(status_msg, f"✅ Готово! (task #{task_id})")
 
         if task.get("result_text"):
-            await message.answer(_truncate(task["result_text"], 3500), reply_markup=kb_bottom_panel())
+            text = str(task["result_text"])
+            parts = _split_chunks(text, MAX_TG_TEXT)
+            if len(parts) == 1:
+                await message.answer(parts[0], reply_markup=kb_bottom_panel())
+            else:
+                total = len(parts)
+                for i, part in enumerate(parts, start=1):
+                    await message.answer(f"({i}/{total})\n{part}", reply_markup=kb_bottom_panel())
     else:
         await safe_edit_text(status_msg, f"❌ Ошибка (task #{task_id}): {task.get('error_message') or 'Unknown error'}")
 
 
 # -----------------------
-# /start + stubs
+# Start / Cancel
 # -----------------------
 @router.message(F.text == "/start")
 async def start(message: Message):
     await message.answer("🤖 GenBot\n\nВыбери раздел снизу 👇", reply_markup=kb_bottom_panel())
 
 
-@router.message(F.text == "🔊 Аудио")
-async def audio_stub(message: Message):
-    await message.answer("🔊 Аудио пока в разработке.", reply_markup=kb_bottom_panel())
+@router.message(F.text.in_({"/cancel", "Отмена"}))
+async def cancel(message: Message):
+    _reset_all(message.from_user.id)
+    await message.answer("Ок, отменил ✅", reply_markup=kb_bottom_panel())
 
 
-@router.message(F.text == "✍️ Тексты")
-async def text_stub(message: Message):
-    await message.answer("✍️ Тексты пока в разработке.", reply_markup=kb_bottom_panel())
+# -----------------------
+# Menus
+# -----------------------
+@router.message(F.text == "🖼 Изображения")
+async def images_menu(message: Message):
+    uid = message.from_user.id
+    _reset_all(uid)
+    USER_IMAGE_FLOW[uid] = {"step": "action", "meta": {}}
+    await message.answer("🖼 Изображения\n\nВыбери действие:", reply_markup=kb_img_action())
+
+
+@router.message(F.text == "🎵 Музыка")
+async def suno_menu(message: Message):
+    uid = message.from_user.id
+    _reset_all(uid)
+    USER_SUNO_FLOW[uid] = {"step": "title"}
+    await message.answer(
+        "🎵 Suno v5\n\n"
+        "Шаг 1/3: Название песни (title)\n"
+        "Напиши название:",
+        reply_markup=kb_bottom_panel(),
+    )
+
+
+@router.message(F.text == "✍️ Текст")
+async def grok_menu(message: Message):
+    uid = message.from_user.id
+    _reset_all(uid)
+    USER_GROK_FLOW[uid] = {"step": "prompt"}
+    await message.answer(
+        "✍️ Grok 4.1\n\n"
+        "Напиши запрос одним сообщением.\n"
+        "Если ответ будет длинный, пришлю частями (1/2, 2/2...).",
+        reply_markup=kb_bottom_panel(),
+    )
 
 
 @router.message(F.text == "👛 Баланс")
@@ -302,18 +363,7 @@ async def balance_stub(message: Message):
 
 
 # -----------------------
-# Images entry
-# -----------------------
-@router.message(F.text == "🖼 Изображения")
-async def images_menu(message: Message):
-    uid = message.from_user.id
-    _reset(uid)
-    USER_IMAGE_FLOW[uid] = {"step": "action", "meta": {}}
-    await message.answer("🖼 Изображения\n\nВыбери действие:", reply_markup=kb_img_action())
-
-
-# -----------------------
-# Callbacks
+# Images callbacks
 # -----------------------
 @router.callback_query(F.data.startswith("img:back:"))
 async def cb_back(cb: CallbackQuery):
@@ -341,20 +391,9 @@ async def cb_back(cb: CallbackQuery):
         await cb.answer()
         return
 
-    if where == "ar":
-        flow["step"] = "ar"
-        await safe_edit_text(cb.message, "Выбери соотношение сторон (aspect_ratio):", reply_markup=kb_img_ar())
-        await cb.answer()
-        return
-
-    # назад с пресетов
-    if where == "presetprev":
-        if flow.get("engine") == "gpt":
-            flow["step"] = "size"
-            await safe_edit_text(cb.message, "Выбери image_size:", reply_markup=kb_gpt_image_size())
-        else:
-            flow["step"] = "ar"
-            await safe_edit_text(cb.message, "Выбери соотношение сторон (aspect_ratio):", reply_markup=kb_img_ar())
+    if where == "size":
+        flow["step"] = "size"
+        await safe_edit_text(cb.message, "Выбери размер:", reply_markup=kb_img_size3())
         await cb.answer()
         return
 
@@ -418,30 +457,8 @@ async def cb_tier(cb: CallbackQuery):
     flow["tier"] = tier
     _tier_apply_defaults(flow)
 
-    flow["step"] = "ar"
-    await safe_edit_text(cb.message, "Выбери соотношение сторон (aspect_ratio):", reply_markup=kb_img_ar())
-    await cb.answer("Ок")
-
-
-@router.callback_query(F.data.startswith("img:ar:"))
-async def cb_ar(cb: CallbackQuery):
-    uid = cb.from_user.id
-    flow = _img_flow(uid)
-
-    v = cb.data.split(":")[-1]
-    ar = "default" if v == "default" else v.replace("_", ":")
-
-    _set_common_meta(flow)
-    flow["meta"]["aspect_ratio"] = ar
-
-    # GPT: после aspect_ratio спрашиваем image_size
-    if flow.get("engine") == "gpt":
-        flow["step"] = "size"
-        await safe_edit_text(cb.message, "Выбери image_size:", reply_markup=kb_gpt_image_size())
-    else:
-        flow["step"] = "preset"
-        await safe_edit_text(cb.message, "Пресет (опционально):", reply_markup=kb_img_presets())
-
+    flow["step"] = "size"
+    await safe_edit_text(cb.message, "Выбери размер:", reply_markup=kb_img_size3())
     await cb.answer("Ок")
 
 
@@ -453,6 +470,10 @@ async def cb_size(cb: CallbackQuery):
 
     _set_common_meta(flow)
     flow["meta"]["image_size"] = size
+
+    # for nano: derive aspect_ratio from size (simple UX)
+    if flow.get("engine") == "nb":
+        flow["meta"]["aspect_ratio"] = _size_to_ratio(size)
 
     flow["step"] = "preset"
     await safe_edit_text(cb.message, "Пресет (опционально):", reply_markup=kb_img_presets())
@@ -468,10 +489,7 @@ async def cb_preset(cb: CallbackQuery):
     flow["preset_id"] = preset_id
     _tier_apply_defaults(flow)
 
-    # preset_slug для воркера
     USER_MODE[uid] = _build_slug(flow)
-
-    # базовый промпт из пресета (можно пусто)
     USER_PENDING_TEXT[uid] = _preset_prompt(preset_id).strip()
 
     if flow["action"] == "create":
@@ -480,18 +498,18 @@ async def cb_preset(cb: CallbackQuery):
             cb.message,
             "✅ Готово.\n\n"
             "Теперь напиши промпт.\n"
-            "Если выбрал пресет, можно просто уточнить детали.",
+            "Если выбрал пресет, можно просто уточнить детали.\n"
+            "Отмена: /cancel",
         )
     else:
-        # Мягко: просим 1–2 фото ОДНИМ сообщением (альбомом), потом промпт
         flow["step"] = "wait_photos_edit"
         USER_PENDING_FILES[uid] = []
         await safe_edit_text(
             cb.message,
             "✅ Готово.\n\n"
-            "Теперь отправь 1 или 2 фото ОДНИМ сообщением (альбомом).\n"
+            "Отправь 1 или 2 фото ОДНИМ сообщением (альбомом).\n"
             "После этого напиши промпт.\n\n"
-            "Подсказка: выбери 2 фото в галерее и отправь одним разом.",
+            "Отмена: /cancel",
         )
 
     await cb.answer("Ок")
@@ -503,16 +521,64 @@ async def cb_preset(cb: CallbackQuery):
 @router.message()
 async def any_message(message: Message):
     uid = message.from_user.id
-    flow = USER_IMAGE_FLOW.get(uid)
 
-    panel_buttons = {"🖼 Изображения", "🔊 Аудио", "✍️ Тексты", "👛 Баланс"}
+    panel_buttons = {"🖼 Изображения", "🎵 Музыка", "✍️ Текст", "👛 Баланс"}
     is_panel_button = message.text in panel_buttons if message.text else False
 
-    # detect file_id (photo/document)
+    # ---- SUNO flow ----
+    sf = USER_SUNO_FLOW.get(uid)
+    if sf and message.text and not message.text.startswith("/") and not is_panel_button:
+        step = sf.get("step")
+
+        if step == "title":
+            sf["title"] = message.text.strip()
+            sf["step"] = "tags"
+            await message.answer(
+                "Шаг 2/3: Музыкальные стили (tags)\n"
+                "Напиши через запятую (например: pop, cinematic, upbeat):",
+                reply_markup=kb_bottom_panel(),
+            )
+            return
+
+        if step == "tags":
+            sf["tags"] = message.text.strip()
+            sf["step"] = "prompt"
+            await message.answer(
+                "Шаг 3/3: Подсказки (prompt)\n"
+                "Опиши, о чём трек, настроение, инструменты и т.д.:",
+                reply_markup=kb_bottom_panel(),
+            )
+            return
+
+        if step == "prompt":
+            sf["prompt"] = message.text.strip()
+
+            meta = {"title": sf["title"], "tags": sf["tags"], "prompt": sf["prompt"]}
+            input_text = "\n---\n" + json.dumps(meta, ensure_ascii=False)
+
+            api = ApiClient()
+            created = await api.create_task(uid, input_text, None, "suno")
+            await _run_and_deliver(message, created["task_id"])
+
+            USER_SUNO_FLOW.pop(uid, None)
+            return
+
+    # ---- GROK flow ----
+    gf = USER_GROK_FLOW.get(uid)
+    if gf and message.text and not message.text.startswith("/") and not is_panel_button:
+        prompt = message.text.strip()
+        api = ApiClient()
+        created = await api.create_task(uid, prompt, None, "grok")
+        await _run_and_deliver(message, created["task_id"])
+        USER_GROK_FLOW.pop(uid, None)
+        return
+
+    # detect file id
     input_photo_id = message.photo[-1].file_id if message.photo else None
     input_doc_id = message.document.file_id if message.document else None
 
-    # ---- CREATE: ждём текст ----
+    # ---- Images: CREATE prompt ----
+    flow = USER_IMAGE_FLOW.get(uid)
     if flow and flow.get("step") == "wait_text_create":
         if message.text and not message.text.startswith("/") and not is_panel_button:
             user_text = message.text.strip()
@@ -523,51 +589,42 @@ async def any_message(message: Message):
             meta["translate_input"] = False
             input_text = _meta_to_input_text(final_prompt, meta)
 
-            preset_slug = USER_MODE.get(uid)
             api = ApiClient()
-            try:
-                created = await api.create_task(uid, input_text, None, preset_slug)
-            except Exception as e:
-                await message.answer(f"❌ API ошибка: {_truncate(e)}", reply_markup=kb_bottom_panel())
-                return
-
+            created = await api.create_task(uid, input_text, None, USER_MODE.get(uid))
             await _run_and_deliver(message, created["task_id"])
-            _reset(uid)
+            _reset_all(uid)
         return
 
-    # ---- EDIT: ждём 1–2 фото одним сообщением (альбомом) ----
+    # ---- Images: EDIT waiting photos (album 1-2) ----
     if flow and flow.get("step") == "wait_photos_edit":
-        # если юзер пишет текст — просим сначала фото
+        # if user types text -> ask for photos first
         if message.text and not message.text.startswith("/") and not is_panel_button:
             await message.answer(
-                "Сначала отправь 1 или 2 фото одним сообщением (альбомом), потом напиши промпт 🙂",
+                "Сначала отправь 1 или 2 фото одним сообщением (альбомом), потом напиши промпт 🙂\n"
+                "Отмена: /cancel",
                 reply_markup=kb_bottom_panel(),
             )
             return
 
-        # фото (в альбоме или одиночное)
+        # photo: album or single
         if message.photo:
             fid = input_photo_id
 
-            # album mode
             if message.media_group_id:
                 key = _album_key(uid, str(message.media_group_id))
                 ALBUM_PHOTOS.setdefault(key, []).append(fid)
 
-                # reset timer
                 if key in ALBUM_TASKS:
                     ALBUM_TASKS[key].cancel()
 
                 ALBUM_TASKS[key] = asyncio.create_task(_finalize_album(uid, str(message.media_group_id), message))
                 return
 
-            # single photo
             USER_PENDING_FILES[uid] = [fid]
             flow["step"] = "wait_text_edit"
             await message.answer("Фото принято ✅ Теперь напиши промпт (что сделать).", reply_markup=kb_bottom_panel())
             return
 
-        # document as fallback (single)
         if message.document:
             USER_PENDING_FILES[uid] = [input_doc_id]
             flow["step"] = "wait_text_edit"
@@ -576,66 +633,55 @@ async def any_message(message: Message):
 
         return
 
-    # ---- EDIT: ждём текст после фото ----
+    # ---- Images: EDIT waiting text ----
     if flow and flow.get("step") == "wait_text_edit":
         if message.text and not message.text.startswith("/") and not is_panel_button:
             user_text = message.text.strip()
-
             base_prompt = (USER_PENDING_TEXT.get(uid) or "").strip()
             final_prompt = (base_prompt + "\n\n" + user_text).strip() if base_prompt else user_text
 
             photos = USER_PENDING_FILES.get(uid, [])
             if not photos:
-                await message.answer("Не вижу фото. Отправь 1 или 2 фото одним сообщением (альбомом).", reply_markup=kb_bottom_panel())
+                await message.answer("Не вижу фото. Отправь 1–2 фото одним сообщением (альбомом).", reply_markup=kb_bottom_panel())
                 return
 
             meta = flow.get("meta", {})
             meta["translate_input"] = False
 
-            # nano edit: 1–2 фото через tg_file_ids (worker сделает image_urls)
-            if _is_nano_edit(flow):
+            # nano edit: pass tg_file_ids (1-2)
+            if flow.get("engine") == "nb" and flow.get("action") == "edit":
                 meta["tg_file_ids"] = photos[:2]
                 file_id_for_api = photos[0]
             else:
-                # gpt edit: берём первое фото
                 file_id_for_api = photos[0]
 
             input_text = _meta_to_input_text(final_prompt, meta)
-            preset_slug = USER_MODE.get(uid)
 
             api = ApiClient()
-            try:
-                created = await api.create_task(uid, input_text, file_id_for_api, preset_slug)
-            except Exception as e:
-                await message.answer(f"❌ API ошибка: {_truncate(e)}", reply_markup=kb_bottom_panel())
-                return
-
+            created = await api.create_task(uid, input_text, file_id_for_api, USER_MODE.get(uid))
             await _run_and_deliver(message, created["task_id"])
-            _reset(uid)
+            _reset_all(uid)
         return
 
-    # ---- Generic file submit (SeedVR) ----
-    # После выбора seedvr_x2/x4 бот ждёт файл; тут просто отправляем как обычную задачу.
+    # ---- Generic file submit: SeedVR ----
     if message.photo or message.document:
         preset_slug = USER_MODE.get(uid)
         if not preset_slug:
-            # не в режиме, просто подсказка
-            if message.photo or message.document:
-                await message.answer("Зайди в 🖼 Изображения и выбери действие 👇", reply_markup=kb_bottom_panel())
+            await message.answer("Зайди в 🖼 Изображения и выбери действие 👇", reply_markup=kb_bottom_panel())
             return
 
-        api = ApiClient()
         input_tg_file_id = input_photo_id or input_doc_id
-        try:
-            created = await api.create_task(uid, USER_PENDING_TEXT.pop(uid, None), input_tg_file_id, preset_slug)
-        except Exception as e:
-            await message.answer(f"❌ API ошибка: {_truncate(e)}", reply_markup=kb_bottom_panel())
-            return
-
+        api = ApiClient()
+        created = await api.create_task(uid, USER_PENDING_TEXT.pop(uid, None), input_tg_file_id, preset_slug)
         await _run_and_deliver(message, created["task_id"])
-        _reset(uid)
+        _reset_all(uid)
         return
 
-    # ---- Text outside flows ----
+    # ---- plain text outside flows ----
     if message.text and not message.text.startswith("/") and not is_panel_button:
-        await message.answer("Зайди в 🖼 Изображения и выбери действие 👇", reply_markup=kb_bottom_panel())
+        await message.answer(
+            "Выбери раздел снизу 👇\n"
+            "🖼 Изображения / 🎵 Музыка / ✍️ Текст\n"
+            "Отмена: /cancel",
+            reply_markup=kb_bottom_panel(),
+        )

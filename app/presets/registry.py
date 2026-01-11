@@ -28,6 +28,51 @@ class Preset:
 
 
 PRESETS: dict[str, Preset] = {
+    # ==========================
+    # AUDIO: Suno v5
+    # ==========================
+    "suno": Preset(
+        slug="suno",
+        title="🎵 Музыка (Suno v5)",
+        category="tools",
+        provider_target="network",
+        provider_id="suno",
+        implementation=None,
+        input_kind="none",
+        price_credits=0,
+        params={
+            "model": "v5",
+            "translate_input": False,
+        },
+        input_field="image_url",
+        input_hint="Соберу title/tags/prompt и сгенерирую трек.",
+        mode_title="🎵 Suno v5",
+    ),
+
+    # ==========================
+    # TEXT: Grok 4.1
+    # ==========================
+    "grok": Preset(
+        slug="grok",
+        title="✍️ Текст (Grok 4.1)",
+        category="tools",
+        provider_target="network",
+        provider_id="grok-4-1",
+        implementation=None,
+        input_kind="none",
+        price_credits=0,
+        params={
+            "model": "grok-4-1-fast-reasoning",
+            "stream": False,
+        },
+        input_field="image_url",
+        input_hint="Напиши запрос, я верну ответ.",
+        mode_title="✍️ Grok 4.1",
+    ),
+
+    # ==========================
+    # SeedVR upscale
+    # ==========================
     "seedvr_x2": Preset(
         slug="seedvr_x2",
         title="✨ Upscale (SeedVR x2)",
@@ -57,7 +102,10 @@ PRESETS: dict[str, Preset] = {
         mode_title="✨ Upscale x4",
     ),
 
-    # ---- Nano Banana ----
+    # ==========================
+    # IMAGES: NanoBanana + GPTImage
+    # ==========================
+    # NanoBanana create (text2img)
     "img_nb_std_create": Preset(
         slug="img_nb_std_create",
         title="🍌 NanoBanana Standard • Создать",
@@ -68,13 +116,12 @@ PRESETS: dict[str, Preset] = {
         input_kind="none",
         price_credits=0,
         params={
-            "translate_input": False,  # в nano по умолчанию true :contentReference[oaicite:2]{index=2}
+            "translate_input": False,
             "num_images": 1,
             "output_format": "png",
-            "aspect_ratio": "default",
             "resolution": "2K",
         },
-        input_field="image_urls",  # не используется при create, но пусть будет едино
+        input_field="image_urls",
         input_hint="Напиши промпт (можно выбрать пресет).",
         mode_title="🍌 NB Std • Create",
     ),
@@ -91,7 +138,6 @@ PRESETS: dict[str, Preset] = {
             "translate_input": False,
             "num_images": 1,
             "output_format": "png",
-            "aspect_ratio": "default",
             "resolution": "2K",
             "quality": "high",
         },
@@ -99,6 +145,8 @@ PRESETS: dict[str, Preset] = {
         input_hint="Напиши промпт (можно выбрать пресет).",
         mode_title="🍌 NB Pro • Create",
     ),
+
+    # NanoBanana edit (img2img), multi-image supported via input_field=image_urls
     "img_nb_std_edit": Preset(
         slug="img_nb_std_edit",
         title="🍌 NanoBanana Standard • Редактировать",
@@ -112,12 +160,11 @@ PRESETS: dict[str, Preset] = {
             "translate_input": False,
             "num_images": 1,
             "output_format": "png",
-            "aspect_ratio": "default",
             "resolution": "2K",
         },
-        input_field="image_urls",  # <<< мульти-вход
-        input_hint="Пришли 2 фото (обязательно), потом промпт (или выбери пресет).",
-        mode_title="🍌 NB Std • Edit (2 images)",
+        input_field="image_urls",
+        input_hint="Отправь 1–2 фото одним сообщением (альбомом), потом промпт.",
+        mode_title="🍌 NB Std • Edit",
     ),
     "img_nb_pro_edit": Preset(
         slug="img_nb_pro_edit",
@@ -132,16 +179,15 @@ PRESETS: dict[str, Preset] = {
             "translate_input": False,
             "num_images": 1,
             "output_format": "png",
-            "aspect_ratio": "default",
             "resolution": "2K",
             "quality": "high",
         },
-        input_field="image_urls",  # <<< мульти-вход
-        input_hint="Пришли 2 фото (обязательно), потом промпт (или выбери пресет).",
-        mode_title="🍌 NB Pro • Edit (2 images)",
+        input_field="image_urls",
+        input_hint="Отправь 1–2 фото одним сообщением (альбомом), потом промпт.",
+        mode_title="🍌 NB Pro • Edit",
     ),
 
-    # ---- GPT Image 1.5 ----
+    # GPTImage create/edit (text2img + img2img)
     "img_gpt_std_create": Preset(
         slug="img_gpt_std_create",
         title="🎨 GPTImage Standard • Создать",
@@ -155,9 +201,8 @@ PRESETS: dict[str, Preset] = {
             "translate_input": False,
             "num_images": 1,
             "output_format": "png",
-            "aspect_ratio": "default",
             "image_size": "1024x1024",
-            "quality": "medium",
+            "quality": "low",
         },
         input_field="image_url",
         input_hint="Напиши промпт (можно выбрать пресет).",
@@ -176,9 +221,8 @@ PRESETS: dict[str, Preset] = {
             "translate_input": False,
             "num_images": 1,
             "output_format": "png",
-            "aspect_ratio": "default",
             "image_size": "1024x1024",
-            "quality": "high",
+            "quality": "medium",
         },
         input_field="image_url",
         input_hint="Напиши промпт (можно выбрать пресет).",
@@ -197,12 +241,11 @@ PRESETS: dict[str, Preset] = {
             "translate_input": False,
             "num_images": 1,
             "output_format": "png",
-            "aspect_ratio": "default",
             "image_size": "1024x1024",
-            "quality": "medium",
+            "quality": "low",
         },
         input_field="image_url",
-        input_hint="Пришли 1 фото, потом промпт (или выбери пресет).",
+        input_hint="Отправь 1 фото, потом промпт.",
         mode_title="🎨 GPT Std • Edit",
     ),
     "img_gpt_pro_edit": Preset(
@@ -218,12 +261,11 @@ PRESETS: dict[str, Preset] = {
             "translate_input": False,
             "num_images": 1,
             "output_format": "png",
-            "aspect_ratio": "default",
             "image_size": "1024x1024",
-            "quality": "high",
+            "quality": "medium",
         },
         input_field="image_url",
-        input_hint="Пришли 1 фото, потом промпт (или выбери пресет).",
+        input_hint="Отправь 1 фото, потом промпт.",
         mode_title="🎨 GPT Pro • Edit",
     ),
 }

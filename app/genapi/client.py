@@ -81,7 +81,14 @@ class GenApiClient:
             for k, v in params.items():
                 if v is None:
                     continue
-                data[k] = str(v) if isinstance(v, (int, float, bool)) else v
+
+                # IMPORTANT: bool должны быть "true"/"false" (lowercase), иначе 422
+                if isinstance(v, bool):
+                    data[k] = "true" if v else "false"
+                elif isinstance(v, (int, float)):
+                    data[k] = str(v)
+                else:
+                    data[k] = v
 
         with httpx.Client(timeout=180, trust_env=False) as client:
             r = client.post(url, headers=self.headers, data=data, files=files)
