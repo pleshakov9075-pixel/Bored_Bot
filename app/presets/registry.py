@@ -188,6 +188,7 @@ PRESETS: dict[str, Preset] = {
     ),
 
     # GPTImage create/edit (text2img + img2img)
+    # ✅ важное: для gpt-image-1-5 используем image_urls (список), а не image_url
     "img_gpt_std_create": Preset(
         slug="img_gpt_std_create",
         title="🎨 GPTImage Standard • Создать",
@@ -204,7 +205,7 @@ PRESETS: dict[str, Preset] = {
             "image_size": "1024x1024",
             "quality": "low",
         },
-        input_field="image_url",
+        input_field="image_urls",
         input_hint="Напиши промпт (можно выбрать пресет).",
         mode_title="🎨 GPT Std • Create",
     ),
@@ -224,7 +225,7 @@ PRESETS: dict[str, Preset] = {
             "image_size": "1024x1024",
             "quality": "medium",
         },
-        input_field="image_url",
+        input_field="image_urls",
         input_hint="Напиши промпт (можно выбрать пресет).",
         mode_title="🎨 GPT Pro • Create",
     ),
@@ -244,7 +245,7 @@ PRESETS: dict[str, Preset] = {
             "image_size": "1024x1024",
             "quality": "low",
         },
-        input_field="image_url",
+        input_field="image_urls",
         input_hint="Отправь 1 фото, потом промпт.",
         mode_title="🎨 GPT Std • Edit",
     ),
@@ -264,7 +265,7 @@ PRESETS: dict[str, Preset] = {
             "image_size": "1024x1024",
             "quality": "medium",
         },
-        input_field="image_url",
+        input_field="image_urls",
         input_hint="Отправь 1 фото, потом промпт.",
         mode_title="🎨 GPT Pro • Edit",
     ),

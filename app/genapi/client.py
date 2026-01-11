@@ -140,7 +140,7 @@ class GenApiClient:
 
         with httpx.Client(timeout=timeout, trust_env=False) as client:
             if not has_files:
-                # ✅ JSON keeps types (bool stays bool) -> fixes translate_input validation 422
+                # ✅ JSON keeps types (bool stays bool)
                 r = self._request_with_retry(
                     client=client,
                     method="POST",
@@ -201,10 +201,8 @@ class GenApiClient:
                 r = client.request(method, url, headers=headers, **kwargs)
 
                 if r.status_code in (419, 500, 502, 503, 504):
-                    # Retryable HTTP
                     if attempt == max_retries:
                         return r
-
                     sleep_for = _jitter(delay)
                     _sleep_bounded(sleep_for, hard_deadline)
                     delay = min(delay * 1.6, 10.0)
@@ -221,7 +219,6 @@ class GenApiClient:
                 _sleep_bounded(sleep_for, hard_deadline)
                 delay = min(delay * 1.6, 10.0)
 
-        # If we got here due to exceptions or deadline
         if last_exc is not None:
             raise RuntimeError(f"GenAPI request failed after retries: {method} {url}") from last_exc
 
@@ -229,10 +226,6 @@ class GenApiClient:
 
 
 def _clean_payload(d: dict[str, Any]) -> dict[str, Any]:
-    """
-    Remove None values and empty containers.
-    Keep bool/int/float/str as-is (for JSON).
-    """
     out: dict[str, Any] = {}
     for k, v in d.items():
         if v is None:
@@ -246,12 +239,6 @@ def _clean_payload(d: dict[str, Any]) -> dict[str, Any]:
 
 
 def _to_form_fields(payload: dict[str, Any]) -> dict[str, str]:
-    """
-    Convert payload to form-data fields (strings).
-    - bool -> "true"/"false"
-    - numbers -> str(number)
-    - everything else -> str(value)
-    """
     out: dict[str, str] = {}
     for k, v in payload.items():
         if v is None:
@@ -266,7 +253,6 @@ def _to_form_fields(payload: dict[str, Any]) -> dict[str, str]:
 
 
 def _jitter(x: float) -> float:
-    # add +-15% jitter
     return x * (0.85 + random.random() * 0.30)
 
 
@@ -281,50 +267,152 @@ def _sleep_bounded(seconds: float, hard_deadline: float | None) -> None:
 
 
 def _extract_best_output(payload: dict) -> tuple[str | None, str | None]:
-    def find_url(x):
-        if isinstance(x, str) and (x.startswith("http://") or x.startswith("https://")):
-            return x
-        if isinstance(x, dict):
-            for k in ("url", "file", "image", "video", "audio", "mesh", "result_url"):
-                u = find_url(x.get(k))
-                if u:
-                    return u
-            for v in x.values():
-                u = find_url(v)
-                if u:
-                    return u
-        if isinstance(x, list):
-            for v in x:
-                u = find_url(v)
-                if u:
-                    return u
+    """
+    Robust extractor:
+      - Prefer OpenAI-like text: choices[0].message.content
+      - Prefer meaningful text fields (ignore control strings like "stop")
+      - Prefer best file url by extension priority if multiple are present
+    """
+
+    # 1) Prefer OpenAI-like structure (Grok / chat.completion style)
+    try:
+        ch = payload.get("choices")
+        if isinstance(ch, list) and ch:
+            m = ch[0].get("message") if isinstance(ch[0], dict) else None
+            if isinstance(m, dict):
+                c = m.get("content")
+                if isinstance(c, str) and c.strip():
+                    text = c.strip()
+                    file_url = _pick_best_url(_collect_urls(payload))
+                    return file_url, text
+    except Exception:
+        pass
+
+    # 2) Then try common explicit fields
+    for k in ("text", "output_text", "content", "message"):
+        v = payload.get(k)
+        if isinstance(v, str) and _is_meaningful_text(v):
+            file_url = _pick_best_url(_collect_urls(payload))
+            return file_url, v.strip()
+
+    # 3) Fallback: deep search but ignore "control" strings
+    text = _find_text_deep(payload)
+    file_url = _pick_best_url(_collect_urls(payload))
+    return file_url, text
+
+
+def _collect_urls(x: Any) -> list[str]:
+    urls: list[str] = []
+
+    def rec(v: Any):
+        if isinstance(v, str) and (v.startswith("http://") or v.startswith("https://")):
+            urls.append(v)
+            return
+        if isinstance(v, dict):
+            for vv in v.values():
+                rec(vv)
+            return
+        if isinstance(v, list):
+            for vv in v:
+                rec(vv)
+            return
+
+    rec(x)
+    # unique keep order
+    seen = set()
+    out = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def _pick_best_url(urls: list[str]) -> str | None:
+    if not urls:
         return None
 
-    def find_text(x):
-        if isinstance(x, str):
-            if x.startswith("http://") or x.startswith("https://"):
-                return None
-            return x.strip() or None
-        if isinstance(x, dict):
-            for k in ("text", "output_text", "message", "content"):
-                v = x.get(k)
-                if isinstance(v, str) and v.strip():
-                    return v
-            for v in x.values():
-                t = find_text(v)
-                if t:
-                    return t
-        if isinstance(x, list):
-            for v in x:
-                t = find_text(v)
-                if t:
-                    return t
+    # Prefer media/output files over input/previews.
+    # Priority: audio > video > images > everything else
+    prio_ext = [
+        ".mp3", ".wav",
+        ".mp4", ".mov", ".webm",
+        ".png", ".jpg", ".jpeg", ".webp", ".gif",
+        ".zip",
+        ".json", ".txt",
+    ]
+
+    def score(u: str) -> tuple[int, int]:
+        low = u.lower()
+        # penalize input_files / uploads references if present
+        penalty = 0
+        if "/input_files/" in low:
+            penalty += 5
+        if "/uploads/" in low:
+            penalty += 2
+        # extension priority
+        ext_rank = 999
+        for i, ext in enumerate(prio_ext):
+            if ext in low:
+                ext_rank = i
+                break
+        return (ext_rank, penalty)
+
+    return sorted(urls, key=score)[0]
+
+
+def _is_meaningful_text(s: str) -> bool:
+    t = (s or "").strip()
+    if not t:
+        return False
+
+    # Drop common control tokens
+    bad = {
+        "stop",
+        "assistant",
+        "user",
+        "chat.completion",
+        "completed",
+        "success",
+        "failed",
+        "queued",
+        "processing",
+    }
+    if t.lower() in bad:
+        return False
+
+    # too short and looks like a flag
+    if len(t) <= 4 and t.isalpha():
+        return False
+
+    return True
+
+
+def _find_text_deep(x: Any) -> str | None:
+    # Prefer known keys in nested dicts first
+    if isinstance(x, dict):
+        # direct hit keys
+        for k in ("content", "text", "output_text", "message"):
+            v = x.get(k)
+            if isinstance(v, str) and _is_meaningful_text(v):
+                return v.strip()
+        # then recurse
+        for v in x.values():
+            t = _find_text_deep(v)
+            if t:
+                return t
         return None
 
-    candidates = []
-    for key in ("output", "result", "response", "data"):
-        if key in payload:
-            candidates.append(payload[key])
-    candidates.append(payload)
+    if isinstance(x, list):
+        for v in x:
+            t = _find_text_deep(v)
+            if t:
+                return t
+        return None
 
-    return find_url(candidates), find_text(candidates)
+    if isinstance(x, str):
+        if x.startswith("http://") or x.startswith("https://"):
+            return None
+        return x.strip() if _is_meaningful_text(x) else None
+
+    return None

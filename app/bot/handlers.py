@@ -15,6 +15,7 @@ from aiogram.types.input_file import BufferedInputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 
+from app.core.config import settings
 from app.bot.api_client import ApiClient
 from app.bot.polling import wait_task_done
 
@@ -27,18 +28,15 @@ USER_MODE: dict[int, str] = {}               # preset_slug
 USER_PENDING_TEXT: dict[int, str] = {}       # prompt (preset + details)
 USER_PENDING_FILES: dict[int, list[str]] = {}  # photo file_ids (1-2)
 
-USER_IMAGE_FLOW: dict[int, dict] = {}        # images flow: step/meta/action/engine/tier/...
-USER_SUNO_FLOW: dict[int, dict] = {}         # suno flow: title->tags->prompt
-USER_GROK_FLOW: dict[int, dict] = {}         # grok flow: prompt
+USER_IMAGE_FLOW: dict[int, dict] = {}
+USER_SUNO_FLOW: dict[int, dict] = {}
+USER_GROK_FLOW: dict[int, dict] = {}
+USER_PAY_FLOW: dict[int, dict] = {}
 
-# Album buffers
 ALBUM_PHOTOS: dict[tuple[int, str], list[str]] = {}
 ALBUM_TASKS: dict[tuple[int, str], asyncio.Task] = {}
 
 
-# -----------------------
-# Utils
-# -----------------------
 def _truncate(text: str, limit: int = MAX_TG_TEXT) -> str:
     if text is None:
         return ""
@@ -49,10 +47,6 @@ def _truncate(text: str, limit: int = MAX_TG_TEXT) -> str:
 
 
 def _split_chunks(text: str, limit: int = MAX_TG_TEXT) -> list[str]:
-    """
-    Режем длинный текст на куски <= limit.
-    Стараемся резать по переносам строк, чтобы было читаемо.
-    """
     text = str(text or "")
     if len(text) <= limit:
         return [text]
@@ -75,7 +69,6 @@ async def safe_edit_text(msg: Message, text: str, reply_markup=None):
     try:
         await msg.edit_text(text, reply_markup=reply_markup)
     except TelegramNetworkError:
-        # сеть/таймаут — просто отправим новое сообщение
         await msg.answer(text, reply_markup=reply_markup)
         return
     except TelegramBadRequest as e:
@@ -111,21 +104,23 @@ def load_image_presets() -> list[dict]:
     return data.get("presets", [])
 
 
-# -----------------------
-# Keyboards: Balance / Payments
-# -----------------------
+def _public_file_url(key: str) -> str:
+    base = str(settings.API_PUBLIC_BASE_URL).rstrip("/")
+    key = (key or "").lstrip("/")
+    return f"{base}/files/{key}"
+
+
 def kb_payments():
     kb = InlineKeyboardBuilder()
-    kb.button(text="💳 Пополнить 99 ₽", callback_data="pay:topup:99")
-    kb.button(text="💳 Пополнить 299 ₽", callback_data="pay:topup:299")
-    kb.button(text="💳 Пополнить 999 ₽", callback_data="pay:topup:999")
-    kb.adjust(1, 1, 1)
+    kb.button(text="💳 99 ₽", callback_data="pay:topup:99")
+    kb.button(text="💳 299 ₽", callback_data="pay:topup:299")
+    kb.button(text="💳 459 ₽", callback_data="pay:topup:459")
+    kb.button(text="💳 999 ₽", callback_data="pay:topup:999")
+    kb.button(text="✍️ Другая сумма", callback_data="pay:topup:custom")
+    kb.adjust(2, 2, 1)
     return kb.as_markup()
 
 
-# -----------------------
-# Keyboards: Images
-# -----------------------
 def kb_img_action():
     kb = InlineKeyboardBuilder()
     kb.button(text="✨ Upscale (SeedVR)", callback_data="img:action:upscale")
@@ -183,9 +178,6 @@ def kb_seedvr_scale():
     return kb.as_markup()
 
 
-# -----------------------
-# Helpers: Images
-# -----------------------
 def _img_flow(uid: int) -> dict:
     return USER_IMAGE_FLOW.setdefault(uid, {"step": "action", "meta": {}})
 
@@ -197,6 +189,7 @@ def _reset_all(uid: int):
     USER_IMAGE_FLOW.pop(uid, None)
     USER_SUNO_FLOW.pop(uid, None)
     USER_GROK_FLOW.pop(uid, None)
+    USER_PAY_FLOW.pop(uid, None)
 
 
 def _build_slug(flow: dict) -> str:
@@ -217,7 +210,6 @@ def _tier_apply_defaults(flow: dict):
     tier = flow.get("tier")
 
     if engine == "gpt":
-        # requested: Standard=low, Pro=medium
         meta["quality"] = "medium" if tier == "pro" else "low"
         meta.setdefault("image_size", "1024x1024")
 
@@ -230,7 +222,6 @@ def _tier_apply_defaults(flow: dict):
 
 
 def _size_to_ratio(size: str) -> str:
-    # mapping to help nano: ratio derived from size
     if size == "1024x1024":
         return "1:1"
     if size == "1024x1536":
@@ -284,43 +275,102 @@ async def _finalize_album(uid: int, media_group_id: str, message: Message):
         await message.answer("2 фото принято ✅ Теперь напиши промпт (что сделать).", reply_markup=kb_bottom_panel())
 
 
-# -----------------------
-# Delivery
-# -----------------------
+def _file_kind_by_name(filename: str) -> str:
+    low = (filename or "").lower()
+    if any(low.endswith(x) for x in (".mp3", ".wav", ".ogg")):
+        return "audio"
+    if any(low.endswith(x) for x in (".mp4", ".mov", ".webm")):
+        return "video"
+    if any(low.endswith(x) for x in (".png", ".jpg", ".jpeg", ".webp", ".gif")):
+        return "image"
+    return "document"
+
+
+async def _send_file_best_effort(message: Message, data: bytes, filename: str):
+    kind = _file_kind_by_name(filename)
+
+    # 1) preferred send methods
+    try:
+        if kind == "audio":
+            await message.answer_audio(BufferedInputFile(data, filename=filename), reply_markup=kb_bottom_panel())
+            return
+        if kind == "video":
+            await message.answer_video(BufferedInputFile(data, filename=filename), reply_markup=kb_bottom_panel())
+            return
+        if kind == "image":
+            # Telegram likes photos, but fallback to document if needed
+            try:
+                await message.answer_photo(BufferedInputFile(data, filename=filename), reply_markup=kb_bottom_panel())
+                return
+            except Exception:
+                await message.answer_document(BufferedInputFile(data, filename=filename), reply_markup=kb_bottom_panel())
+                return
+
+        await message.answer_document(BufferedInputFile(data, filename=filename), reply_markup=kb_bottom_panel())
+        return
+    except Exception:
+        # 2) hard fallback to document
+        await message.answer_document(BufferedInputFile(data, filename=filename), reply_markup=kb_bottom_panel())
+
+
 async def _run_and_deliver(message: Message, task_id: int):
     api = ApiClient()
     status_msg = await message.answer(
         f"🕒 Задача #{task_id} создана.\nСтатус: в очереди…",
         reply_markup=kb_bottom_panel(),
     )
-    task = await wait_task_done(task_id, timeout_sec=900)
+
+    task = await wait_task_done(task_id, timeout_sec=1800)
 
     if task["status"] == "success":
+        sent_anything = False
+
         key = task.get("result_file_key")
         if key:
-            data = await api.download_file(key)
             filename = key.split("/")[-1]
-            await safe_edit_text(status_msg, f"✅ Готово! (task #{task_id})")
-            await message.answer_document(BufferedInputFile(data, filename=filename), reply_markup=kb_bottom_panel())
+            try:
+                data = await api.download_file(key)
+                await safe_edit_text(
+                    status_msg,
+                    f"✅ Готово! (task #{task_id})\n\nФайл: {filename} ({len(data)/1024/1024:.2f} MB)",
+                )
+                await _send_file_best_effort(message, data, filename)
+                sent_anything = True
+            except Exception as e:
+                await safe_edit_text(status_msg, f"✅ Готово! (task #{task_id})")
+                pub = _public_file_url(key)
+                await message.answer(
+                    "⚠️ Результат готов, но не смог скачать/отправить файл.\n"
+                    f"Файл: {filename}\n"
+                    f"Причина: {e}\n\n"
+                    f"✅ Ссылка на файл:\n{pub}",
+                    reply_markup=kb_bottom_panel(),
+                )
+                sent_anything = True
         else:
             await safe_edit_text(status_msg, f"✅ Готово! (task #{task_id})")
 
         if task.get("result_text"):
             text = str(task["result_text"])
             parts = _split_chunks(text, MAX_TG_TEXT)
-            if len(parts) == 1:
-                await message.answer(parts[0], reply_markup=kb_bottom_panel())
-            else:
-                total = len(parts)
-                for i, part in enumerate(parts, start=1):
+            total = len(parts)
+            for i, part in enumerate(parts, start=1):
+                if total == 1:
+                    await message.answer(part, reply_markup=kb_bottom_panel())
+                else:
                     await message.answer(f"({i}/{total})\n{part}", reply_markup=kb_bottom_panel())
+            sent_anything = True
+
+        if not sent_anything:
+            await message.answer("✅ Готово! Но в ответе нет ни файла, ни текста.", reply_markup=kb_bottom_panel())
+
     else:
-        await safe_edit_text(status_msg, f"❌ Ошибка (task #{task_id}): {task.get('error_message') or 'Unknown error'}")
+        await safe_edit_text(
+            status_msg,
+            f"❌ Ошибка (task #{task_id}): {task.get('error_message') or 'Unknown error'}",
+        )
 
 
-# -----------------------
-# Start / Cancel
-# -----------------------
 @router.message(F.text == "/start")
 async def start(message: Message):
     await message.answer("🤖 GenBot\n\nВыбери раздел снизу 👇", reply_markup=kb_bottom_panel())
@@ -332,9 +382,6 @@ async def cancel(message: Message):
     await message.answer("Ок, отменил ✅", reply_markup=kb_bottom_panel())
 
 
-# -----------------------
-# Menus
-# -----------------------
 @router.message(F.text == "🖼 Изображения")
 async def images_menu(message: Message):
     uid = message.from_user.id
@@ -374,17 +421,26 @@ async def balance(message: Message):
     api = ApiClient()
     b = await api.get_balance(message.from_user.id)
     await message.answer(
-        f"👛 Баланс: {b['credits']} кредит(ов)\n\n"
-        "Пополнение подключено через YooKassa (тест).",
+        f"👛 Баланс: {b['credits']} кредит(ов)\n\nВыбери сумму пополнения:",
+        reply_markup=kb_payments(),
+    )
+
+
+@router.callback_query(F.data == "pay:topup:custom")
+async def cb_pay_custom(cb: CallbackQuery):
+    uid = cb.from_user.id
+    USER_PAY_FLOW[uid] = {"step": "amount"}
+    await cb.message.answer(
+        "✍️ Введи сумму пополнения в рублях одним сообщением.\n"
+        "Пример: 550\n\n"
+        "Ограничения: от 10 до 50000 ₽.\n"
+        "Отмена: /cancel",
         reply_markup=kb_bottom_panel(),
     )
-    await message.answer("Выбери сумму пополнения:", reply_markup=kb_payments())
+    await cb.answer("Ок")
 
 
-# -----------------------
-# Payments callbacks
-# -----------------------
-@router.callback_query(F.data.startswith("pay:topup:"))
+@router.callback_query(F.data.startswith("pay:topup:") & ~F.data.endswith(":custom"))
 async def cb_topup(cb: CallbackQuery):
     uid = cb.from_user.id
     try:
@@ -401,11 +457,10 @@ async def cb_topup(cb: CallbackQuery):
             await cb.answer("Не удалось получить ссылку на оплату", show_alert=True)
             return
 
-        # Telegram clickable link
         await cb.message.answer(
             f"💳 Оплата на {amount} ₽\n\n"
-            f"Перейди по ссылке и оплати:\n{url}\n\n"
-            "После оплаты начисление кредитов подключим через вебхук YooKassa.",
+            f"Ссылка для оплаты:\n{url}\n\n"
+            "Начисление кредитов через вебхук подключим следующим шагом.",
             reply_markup=kb_bottom_panel(),
         )
         await cb.answer("Ссылка готова ✅")
@@ -414,9 +469,7 @@ async def cb_topup(cb: CallbackQuery):
         await cb.message.answer(f"❌ Не смог создать платеж: {e}", reply_markup=kb_bottom_panel())
 
 
-# -----------------------
-# Images callbacks
-# -----------------------
+# ---- Images callbacks & main handler ----
 @router.callback_query(F.data.startswith("img:back:"))
 async def cb_back(cb: CallbackQuery):
     uid = cb.from_user.id
@@ -493,7 +546,7 @@ async def cb_seedvr(cb: CallbackQuery):
 async def cb_engine(cb: CallbackQuery):
     uid = cb.from_user.id
     flow = _img_flow(uid)
-    engine = cb.data.split(":")[-1]  # nb/gpt
+    engine = cb.data.split(":")[-1]
     flow["engine"] = engine
     flow["step"] = "tier"
     await safe_edit_text(cb.message, "Выбери режим (Standard/Pro):", reply_markup=kb_img_tier())
@@ -504,7 +557,7 @@ async def cb_engine(cb: CallbackQuery):
 async def cb_tier(cb: CallbackQuery):
     uid = cb.from_user.id
     flow = _img_flow(uid)
-    tier = cb.data.split(":")[-1]  # std/pro
+    tier = cb.data.split(":")[-1]
 
     flow["tier"] = tier
     _tier_apply_defaults(flow)
@@ -523,7 +576,6 @@ async def cb_size(cb: CallbackQuery):
     _set_common_meta(flow)
     flow["meta"]["image_size"] = size
 
-    # for nano: derive aspect_ratio from size (simple UX)
     if flow.get("engine") == "nb":
         flow["meta"]["aspect_ratio"] = _size_to_ratio(size)
 
@@ -567,9 +619,6 @@ async def cb_preset(cb: CallbackQuery):
     await cb.answer("Ок")
 
 
-# -----------------------
-# Main message handler
-# -----------------------
 @router.message()
 async def any_message(message: Message):
     uid = message.from_user.id
@@ -577,11 +626,40 @@ async def any_message(message: Message):
     panel_buttons = {"🖼 Изображения", "🎵 Музыка", "✍️ Текст", "👛 Баланс"}
     is_panel_button = message.text in panel_buttons if message.text else False
 
-    # ---- SUNO flow ----
+    # payment custom
+    pf = USER_PAY_FLOW.get(uid)
+    if pf and pf.get("step") == "amount" and message.text and not message.text.startswith("/") and not is_panel_button:
+        s = message.text.strip().replace(" ", "")
+        try:
+            amount = int(s)
+        except Exception:
+            await message.answer("Напиши сумму числом. Пример: 550", reply_markup=kb_bottom_panel())
+            return
+        if amount < 10 or amount > 50000:
+            await message.answer("Сумма должна быть от 10 до 50000 ₽.", reply_markup=kb_bottom_panel())
+            return
+        api = ApiClient()
+        try:
+            resp = await api.create_topup(uid, amount_rub=amount, description="Пополнение кредитов GenBot")
+            url = resp.get("confirmation_url")
+            if not url:
+                await message.answer("Не удалось получить ссылку на оплату.", reply_markup=kb_bottom_panel())
+                USER_PAY_FLOW.pop(uid, None)
+                return
+            await message.answer(
+                f"💳 Оплата на {amount} ₽\n\nСсылка:\n{url}\n\n"
+                "Начисление кредитов через вебхук подключим следующим шагом.",
+                reply_markup=kb_bottom_panel(),
+            )
+        except Exception as e:
+            await message.answer(f"❌ Ошибка создания платежа: {e}", reply_markup=kb_bottom_panel())
+        USER_PAY_FLOW.pop(uid, None)
+        return
+
+    # suno flow
     sf = USER_SUNO_FLOW.get(uid)
     if sf and message.text and not message.text.startswith("/") and not is_panel_button:
         step = sf.get("step")
-
         if step == "title":
             sf["title"] = message.text.strip()
             sf["step"] = "tags"
@@ -591,7 +669,6 @@ async def any_message(message: Message):
                 reply_markup=kb_bottom_panel(),
             )
             return
-
         if step == "tags":
             sf["tags"] = message.text.strip()
             sf["step"] = "prompt"
@@ -601,21 +678,17 @@ async def any_message(message: Message):
                 reply_markup=kb_bottom_panel(),
             )
             return
-
         if step == "prompt":
             sf["prompt"] = message.text.strip()
-
             meta = {"title": sf["title"], "tags": sf["tags"], "prompt": sf["prompt"]}
             input_text = "\n---\n" + json.dumps(meta, ensure_ascii=False)
-
             api = ApiClient()
             created = await api.create_task(uid, input_text, None, "suno")
             await _run_and_deliver(message, created["task_id"])
-
             USER_SUNO_FLOW.pop(uid, None)
             return
 
-    # ---- GROK flow ----
+    # grok flow
     gf = USER_GROK_FLOW.get(uid)
     if gf and message.text and not message.text.startswith("/") and not is_panel_button:
         prompt = message.text.strip()
@@ -625,13 +698,20 @@ async def any_message(message: Message):
         USER_GROK_FLOW.pop(uid, None)
         return
 
-    # detect file id
     input_photo_id = message.photo[-1].file_id if message.photo else None
     input_doc_id = message.document.file_id if message.document else None
 
-    # ---- Images: CREATE prompt ----
     flow = USER_IMAGE_FLOW.get(uid)
     if flow and flow.get("step") == "wait_text_create":
+        if message.photo or message.document:
+            await message.answer(
+                "Это режим 🧠 *Создать по тексту*.\n"
+                "Фото сюда не нужно 🙂\n\n"
+                "Если хочешь обработать фото — выбери 🪄 *Редактировать фото*.",
+                reply_markup=kb_bottom_panel(),
+            )
+            return
+
         if message.text and not message.text.startswith("/") and not is_panel_button:
             user_text = message.text.strip()
             base_prompt = (USER_PENDING_TEXT.get(uid) or "").strip()
@@ -647,9 +727,7 @@ async def any_message(message: Message):
             _reset_all(uid)
         return
 
-    # ---- Images: EDIT waiting photos (album 1-2) ----
     if flow and flow.get("step") == "wait_photos_edit":
-        # if user types text -> ask for photos first
         if message.text and not message.text.startswith("/") and not is_panel_button:
             await message.answer(
                 "Сначала отправь 1 или 2 фото одним сообщением (альбомом), потом напиши промпт 🙂\n"
@@ -658,20 +736,15 @@ async def any_message(message: Message):
             )
             return
 
-        # photo: album or single
         if message.photo:
             fid = input_photo_id
-
             if message.media_group_id:
                 key = _album_key(uid, str(message.media_group_id))
                 ALBUM_PHOTOS.setdefault(key, []).append(fid)
-
                 if key in ALBUM_TASKS:
                     ALBUM_TASKS[key].cancel()
-
                 ALBUM_TASKS[key] = asyncio.create_task(_finalize_album(uid, str(message.media_group_id), message))
                 return
-
             USER_PENDING_FILES[uid] = [fid]
             flow["step"] = "wait_text_edit"
             await message.answer("Фото принято ✅ Теперь напиши промпт (что сделать).", reply_markup=kb_bottom_panel())
@@ -685,7 +758,6 @@ async def any_message(message: Message):
 
         return
 
-    # ---- Images: EDIT waiting text ----
     if flow and flow.get("step") == "wait_text_edit":
         if message.text and not message.text.startswith("/") and not is_panel_button:
             user_text = message.text.strip()
@@ -700,7 +772,6 @@ async def any_message(message: Message):
             meta = flow.get("meta", {})
             meta["translate_input"] = False
 
-            # nano edit: pass tg_file_ids (1-2)
             if flow.get("engine") == "nb" and flow.get("action") == "edit":
                 meta["tg_file_ids"] = photos[:2]
                 file_id_for_api = photos[0]
@@ -715,11 +786,18 @@ async def any_message(message: Message):
             _reset_all(uid)
         return
 
-    # ---- Generic file submit: SeedVR ----
     if message.photo or message.document:
         preset_slug = USER_MODE.get(uid)
         if not preset_slug:
             await message.answer("Зайди в 🖼 Изображения и выбери действие 👇", reply_markup=kb_bottom_panel())
+            return
+        if preset_slug and "_create" in preset_slug:
+            await message.answer(
+                "Сейчас выбран режим *Создать по тексту*.\n"
+                "Файл сюда не нужен 🙂\n\n"
+                "Если хочешь обработать файл — выбери *Редактировать фото* или *Upscale*.",
+                reply_markup=kb_bottom_panel(),
+            )
             return
 
         input_tg_file_id = input_photo_id or input_doc_id
@@ -729,7 +807,6 @@ async def any_message(message: Message):
         _reset_all(uid)
         return
 
-    # ---- plain text outside flows ----
     if message.text and not message.text.startswith("/") and not is_panel_button:
         await message.answer(
             "Выбери раздел снизу 👇\n"

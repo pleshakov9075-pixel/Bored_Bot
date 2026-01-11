@@ -24,12 +24,6 @@ def _guess_mime(filename: str) -> str:
 
 
 def _parse_text_and_meta(input_text: str | None) -> tuple[str, dict]:
-    """
-    Формат:
-      <prompt text>
-      ---
-      {json meta}
-    """
     if not input_text:
         return "", {}
     raw = str(input_text)
@@ -54,7 +48,7 @@ def _parse_text_and_meta(input_text: str | None) -> tuple[str, dict]:
 
 def _ext_from_filename(filename: str | None) -> str:
     low = (filename or "").lower()
-    for e in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
+    for e in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp3", ".wav", ".mp4", ".mov", ".webm"):
         if low.endswith(e):
             return e
     return ".bin"
@@ -83,6 +77,74 @@ def _download_with_retry(url: str, timeout_total: float = 300.0) -> bytes:
                     raise RuntimeError(f"Download failed by deadline: {e}") from e
                 time.sleep(delay * (0.85 + random.random() * 0.3))
                 delay = min(delay * 1.6, 8.0)
+
+
+def _collect_urls(x) -> list[str]:
+    urls: list[str] = []
+
+    def rec(v):
+        if isinstance(v, str) and (v.startswith("http://") or v.startswith("https://")):
+            urls.append(v)
+            return
+        if isinstance(v, dict):
+            for vv in v.values():
+                rec(vv)
+            return
+        if isinstance(v, list):
+            for vv in v:
+                rec(vv)
+            return
+
+    rec(x)
+    seen = set()
+    out = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def _pick_best_url(urls: list[str]) -> str | None:
+    if not urls:
+        return None
+
+    prio_ext = [
+        ".mp3", ".wav",
+        ".mp4", ".mov", ".webm",
+        ".png", ".jpg", ".jpeg", ".webp", ".gif",
+        ".zip",
+    ]
+
+    def score(u: str) -> tuple[int, int]:
+        low = u.lower()
+        penalty = 0
+        if "cover" in low:
+            penalty += 5
+        if "/input_files/" in low:
+            penalty += 4
+        ext_rank = 999
+        for i, ext in enumerate(prio_ext):
+            if ext in low:
+                ext_rank = i
+                break
+        return (ext_rank, penalty)
+
+    return sorted(urls, key=score)[0]
+
+
+def _grok_extract_text(payload: dict) -> str | None:
+    try:
+        ch = payload.get("choices")
+        if isinstance(ch, list) and ch:
+            m = ch[0].get("message") if isinstance(ch[0], dict) else None
+            if isinstance(m, dict):
+                c = m.get("content")
+                if isinstance(c, str) and c.strip():
+                    return c.strip()
+    except Exception:
+        pass
+    return None
 
 
 def execute_task(task_id: int) -> None:
@@ -130,8 +192,6 @@ def execute_task(task_id: int) -> None:
             user_prompt = (prompt_text or "").strip()
             if not user_prompt:
                 raise RuntimeError("Grok requires prompt text")
-
-            # ✅ ВАЖНО: messages должен быть списком/объектом, а не JSON-строкой
             params["messages"] = [{"role": "user", "content": user_prompt}]
             params.setdefault("model", "grok-4-1-fast-reasoning")
             params.setdefault("stream", False)
@@ -180,7 +240,6 @@ def execute_task(task_id: int) -> None:
 
         elif preset.provider_target == "network":
             if preset.input_kind != "none":
-                # 1) collect tg file ids from meta (preferred)
                 tg_file_ids: list[str] = []
                 v = (meta or {}).get("tg_file_ids")
                 if isinstance(v, list):
@@ -198,17 +257,15 @@ def execute_task(task_id: int) -> None:
                     ext = _ext_from_filename(fn)
                     input_key = f"uploads/task_{task_id}_{preset.slug}_{idx}{ext}"
                     save_bytes(input_key, body)
-                    # ✅ теперь /files реально существует в API
                     urls.append(f"{public_base}/files/{input_key}")
 
+                # ✅ Теперь и для GPT и для Nano используем image_urls
                 if preset.input_field == "image_urls":
                     params["image_urls"] = urls
                 else:
                     params[preset.input_field] = urls[0]
 
-            # FORCE translate_input BOOL
             params["translate_input"] = False
-
             print(f"[task {task_id}] preset={preset.slug} network={preset.provider_id} params={params}")
 
             request_id = gen.submit_network(
@@ -221,17 +278,35 @@ def execute_task(task_id: int) -> None:
             raise RuntimeError(f"Unsupported provider_target={preset.provider_target}")
 
         # ---- poll ----
-        result = gen.poll(request_id, timeout_sec=600)
+        result = gen.poll(request_id, timeout_sec=900)
         if result.status != "success":
             raise RuntimeError(f"GenAPI failed: {result.payload}")
 
-        # ---- store result ----
-        if result.file_url:
-            out_bytes = _download_with_retry(result.file_url, timeout_total=300.0)
+        # ✅ Grok fallback: text from payload
+        if preset.slug == "grok" and not (result.text or "").strip():
+            t = _grok_extract_text(result.payload)
+            if t:
+                result.text = t
 
-            low_url = (result.file_url or "").lower()
+        # ✅ Suno: берём ТОЛЬКО mp3/wav, игнорируем обложку
+        file_url = result.file_url
+        all_urls = _collect_urls(result.payload)
+        if preset.slug == "suno":
+            audio_urls = [u for u in all_urls if any(ext in u.lower() for ext in (".mp3", ".wav"))]
+            if audio_urls:
+                file_url = _pick_best_url(audio_urls)
+
+        # ✅ SeedVR / general: если extractor промахнулся, выберем лучший url по расширению
+        if not file_url and all_urls:
+            file_url = _pick_best_url(all_urls)
+
+        # ---- store result ----
+        if file_url:
+            out_bytes = _download_with_retry(file_url, timeout_total=600.0)
+
+            low_url = (file_url or "").lower()
             ext = ".bin"
-            for e in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".mp4", ".mov", ".mp3", ".wav", ".glb", ".obj", ".txt", ".json"):
+            for e in (".mp3", ".wav", ".mp4", ".mov", ".webm", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".txt", ".json"):
                 if e in low_url:
                     ext = e
                     break

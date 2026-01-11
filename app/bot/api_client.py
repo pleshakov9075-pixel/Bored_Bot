@@ -31,7 +31,8 @@ class ApiClient:
             return r.json()
 
     async def download_file(self, key: str) -> bytes:
-        async with httpx.AsyncClient(timeout=120, trust_env=False) as client:
+        # ✅ большие файлы (Suno/SeedVR) скачиваем терпеливо
+        async with httpx.AsyncClient(timeout=300, trust_env=False, follow_redirects=True) as client:
             r = await client.get(f"{self.base}/internal/files/{key}", headers=self.headers)
             if r.status_code >= 400:
                 raise RuntimeError(f"API error {r.status_code}: {r.text}")
