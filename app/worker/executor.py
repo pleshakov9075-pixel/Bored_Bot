@@ -1,11 +1,12 @@
 ﻿from __future__ import annotations
 
-from datetime import datetime, UTC
-import mimetypes
 import json
-import time
-import random
 import logging
+import mimetypes
+import random
+import time
+from datetime import UTC, datetime
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from sqlalchemy import select, update
@@ -30,13 +31,14 @@ def _log_task_event(
 ) -> None:
     logger = logging.getLogger("task_events")
     try:
+        file_url_clean = _strip_url_query(file_url)
         payload = {
             "event": event,
             "task_id": task_id,
             "preset": preset,
-            "file_url": file_url,
+            "file_url": file_url_clean,
             "result_file_key": result_file_key,
-            "error_message": error_message,
+            "error_message": _redact_secrets(error_message),
         }
         logger.info("task_event=%s", json.dumps(payload, ensure_ascii=False))
     except Exception:
@@ -46,6 +48,23 @@ def _log_task_event(
 def _guess_mime(filename: str) -> str:
     mime, _ = mimetypes.guess_type(filename)
     return mime or "application/octet-stream"
+
+
+def _strip_url_query(url: str | None) -> str | None:
+    if not url:
+        return url
+    parts = urlsplit(url)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+
+
+def _redact_secrets(value: str | None) -> str | None:
+    if not value:
+        return value
+    redacted = value
+    for secret in (settings.GENAPI_TOKEN, settings.BOT_TOKEN):
+        if secret:
+            redacted = redacted.replace(secret, "***")
+    return redacted
 
 
 def _parse_text_and_meta(input_text: str | None) -> tuple[str, dict]:
