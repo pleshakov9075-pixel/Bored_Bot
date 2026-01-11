@@ -1,0 +1,34 @@
+{
+  "presets": [
+    {
+      "id": "simpsons",
+      "title": "🎬 Симпсоны",
+      "prompt": "Transform the image into The Simpsons style. Keep the person recognisable. Clean cartoon linework, flat colors, Springfield vibe."
+    },
+    {
+      "id": "anime",
+      "title": "🧙‍♂️ Аниме",
+      "prompt": "Anime style illustration. Preserve identity, clean shading, detailed eyes, cinematic lighting."
+    },
+    {
+      "id": "portrait",
+      "title": "📸 Деловой портрет",
+      "prompt": "Professional business portrait, clean background, natural skin tones, sharp focus, subtle retouching."
+    },
+    {
+      "id": "cinema",
+      "title": "🌃 Киношный свет",
+      "prompt": "Cinematic lighting and color grading, soft contrast, realistic skin tones, tasteful film look, preserve identity and composition."
+    },
+    {
+      "id": "retouch",
+      "title": "🪄 Ретушь лица",
+      "prompt": "Subtle beauty retouch: even skin tone, remove minor blemishes, keep natural texture, preserve facial features and identity."
+    },
+    {
+      "id": "remove_bg",
+      "title": "🧼 Убрать фон",
+      "prompt": "Remove background cleanly, keep subject edges crisp. If transparency is supported, output with transparent background."
+    }
+  ]
+}

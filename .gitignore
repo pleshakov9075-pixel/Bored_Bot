@@ -20,3 +20,10 @@ data/files/uploads/
 
 # OS
 .DS_Store
+
+# Visual Studio
+.vs/
+*.sln
+*.sqlite
+ProjectSettings.json
+VSWorkspaceState.json

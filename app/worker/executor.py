@@ -2,6 +2,7 @@
 
 from datetime import datetime, UTC
 import mimetypes
+import json
 
 import httpx
 from sqlalchemy import select, update
@@ -18,6 +19,43 @@ from app.worker.telegram_files import tg_download_file
 def _guess_mime(filename: str) -> str:
     mime, _ = mimetypes.guess_type(filename)
     return mime or "application/octet-stream"
+
+
+def _parse_text_and_meta(input_text: str | None) -> tuple[str, dict]:
+    """
+    Формат input_text:
+      <prompt text>
+      ---
+      { "aspect_ratio": "1:1", "image_size": "1024x1024", "tg_file_ids": ["..",".."] }
+    """
+    if not input_text:
+        return "", {}
+    raw = str(input_text)
+
+    sep = "\n---\n"
+    if sep not in raw:
+        return raw.strip(), {}
+
+    prompt, meta_raw = raw.split(sep, 1)
+    prompt = prompt.strip()
+
+    meta = {}
+    try:
+        meta = json.loads(meta_raw.strip())
+        if not isinstance(meta, dict):
+            meta = {}
+    except Exception:
+        meta = {}
+
+    return prompt, meta
+
+
+def _ext_from_filename(filename: str | None) -> str:
+    low = (filename or "").lower()
+    for e in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
+        if low.endswith(e):
+            return e
+    return ".bin"
 
 
 def execute_task(task_id: int) -> None:
@@ -42,37 +80,50 @@ def execute_task(task_id: int) -> None:
 
         gen = GenApiClient(settings.GENAPI_BASE_URL, settings.GENAPI_TOKEN)
 
-        filename = None
-        content = None
-        mime = None
-
-        if preset.input_kind != "none":
-            if not task.input_tg_file_id:
-                raise RuntimeError("No input file. Send image/audio file.")
-            filename, content = tg_download_file(settings.BOT_TOKEN, task.input_tg_file_id)
-            mime = _guess_mime(filename)
-
-        # ---- build params/files ----
         params: dict = dict(preset.params or {})
         files = None
 
-        # Smart prompt mode for outpainting:
-        # - preset.params["prompt"] is a master prompt
-        # - task.input_text is user's extra instruction
+        prompt_text, meta = _parse_text_and_meta(task.input_text)
+
+        # --- outpainting smart prompt (как было) ---
         if preset.slug == "outpainting":
             user_text = (task.input_text or "").strip()
             base_prompt = (params.get("prompt") or "").strip()
             if user_text:
-                if base_prompt:
-                    params["prompt"] = f"{base_prompt}\nUser request: {user_text}"
-                else:
-                    params["prompt"] = user_text
+                params["prompt"] = f"{base_prompt}\nUser request: {user_text}" if base_prompt else user_text
+
+        # --- image presets: img_* ---
+        if preset.slug.startswith("img_"):
+            if prompt_text:
+                params["prompt"] = prompt_text
+
+            # всегда выключаем автоперевод
+            params["translate_input"] = False
+
+            allowed = {
+                "aspect_ratio",
+                "image_size",
+                "quality",
+                "resolution",
+                "num_images",
+                "output_format",
+                "translate_input",
+                "tg_file_ids",  # наше служебное поле
+            }
+            for k, v in (meta or {}).items():
+                if k in allowed and v is not None:
+                    params[k] = v
 
         if preset.provider_target == "function":
+            # функции у тебя только с одним файлом (ок)
+            filename = content = mime = None
             if preset.input_kind != "none":
+                if not task.input_tg_file_id:
+                    raise RuntimeError("No input file. Send image/audio file.")
+                filename, content = tg_download_file(settings.BOT_TOKEN, task.input_tg_file_id)
+                mime = _guess_mime(filename)
                 files = {preset.input_field: (filename, content, mime)}
 
-            # Special case kept: analyze-call (audio + script)
             if preset.slug == "analyze-call":
                 request_id = gen.submit_function(
                     function_id="analyze-call",
@@ -92,22 +143,42 @@ def execute_task(task_id: int) -> None:
                 )
 
         elif preset.provider_target == "network":
-            if preset.input_kind == "none":
-                raise RuntimeError("Network preset requires input file.")
+            # network может быть:
+            # - text2img: input_kind == "none" -> просто params
+            # - img2img: input_kind == "image" -> нужны 1 или 2 изображения
 
-            # For networks we always provide a public URL in params[preset.input_field]
-            ext = ".bin"
-            low = (filename or "").lower()
-            for e in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
-                if low.endswith(e):
-                    ext = e
-                    break
+            if preset.input_kind != "none":
+                # 1) вытаскиваем список file_id
+                tg_file_ids = []
+                if isinstance(meta, dict):
+                    v = meta.get("tg_file_ids")
+                    if isinstance(v, list):
+                        tg_file_ids = [str(x) for x in v if x]
 
-            input_key = f"uploads/task_{task_id}_{preset.slug}{ext}"
-            save_bytes(input_key, content)
+                if not tg_file_ids:
+                    # fallback на один file_id из Task
+                    if not task.input_tg_file_id:
+                        raise RuntimeError("No input file. Send image file.")
+                    tg_file_ids = [task.input_tg_file_id]
 
-            public_base = settings.API_PUBLIC_BASE_URL.rstrip("/")
-            params[preset.input_field] = f"{public_base}/files/{input_key}"
+                # 2) скачиваем каждый файл и делаем публичный URL
+                public_base = str(settings.API_PUBLIC_BASE_URL).rstrip("/")
+                urls: list[str] = []
+
+                for idx, fid in enumerate(tg_file_ids, start=1):
+                    fn, content = tg_download_file(settings.BOT_TOKEN, fid)
+                    ext = _ext_from_filename(fn)
+                    input_key = f"uploads/task_{task_id}_{preset.slug}_{idx}{ext}"
+                    save_bytes(input_key, content)
+                    urls.append(f"{public_base}/files/{input_key}")
+
+                # 3) кладём в params правильным ключом
+                # Nano Banana/Pro в GenAPI используют image_urls (мульти-инпут). :contentReference[oaicite:1]{index=1}
+                if preset.input_field == "image_urls":
+                    params["image_urls"] = urls
+                else:
+                    # общий случай: 1 url
+                    params[preset.input_field] = urls[0]
 
             request_id = gen.submit_network(
                 network_id=preset.provider_id,
@@ -125,7 +196,6 @@ def execute_task(task_id: int) -> None:
 
         # ---- store result ----
         if result.file_url:
-            # Streaming download to avoid timeouts on large files
             with httpx.Client(timeout=httpx.Timeout(300.0, connect=30.0), trust_env=False) as client:
                 with client.stream("GET", result.file_url) as r:
                     r.raise_for_status()
