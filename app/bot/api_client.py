@@ -1,5 +1,16 @@
-﻿import httpx
+﻿from typing import NotRequired, TypedDict
+
+import httpx
 from app.core.config import settings
+
+
+class TaskResponse(TypedDict):
+    task_id: int
+    status: str
+    preset_slug: str
+    result_file_key: NotRequired[str | None]
+    result_text: NotRequired[str | None]
+    error_message: NotRequired[str | None]
 
 
 class ApiClient:
@@ -23,7 +34,7 @@ class ApiClient:
                 raise RuntimeError(f"API error {r.status_code}: {r.text}")
             return r.json()
 
-    async def get_task(self, task_id: int):
+    async def get_task(self, task_id: int) -> TaskResponse:
         async with httpx.AsyncClient(timeout=30, trust_env=False) as client:
             r = await client.get(f"{self.base}/internal/tasks/{task_id}", headers=self.headers)
             if r.status_code >= 400:

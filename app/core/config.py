@@ -9,12 +9,18 @@ class Settings(BaseSettings):
     API_BASE_URL: str = "http://localhost:8080"
     # публичная база (то, что доступно GenAPI извне)
     API_PUBLIC_BASE_URL: str = "http://89.104.69.156:8000"
+    PUBLIC_FILES_BASE_URL: str = ""
 
     INTERNAL_API_KEY: str = "dev-internal-key"
 
     # --- GenAPI ---
     GENAPI_BASE_URL: str = "https://api.gen-api.ru/api/v1"
     GENAPI_TOKEN: str = "sk-1xGvNoyLmRsfDfnglaPKdPvfcp5xPX0mM2lkiNJDfXGThQxdPgeeahUUriEU"
+
+    # Limits
+    MAX_INPUT_FILES: int = 2
+    MAX_INPUT_FILE_SIZE_MB: int = 10
+    TASK_TIMEOUT_SEC: int = 1800
 
     # DB
     DATABASE_URL_ASYNC: str

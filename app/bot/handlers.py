@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import json
+import re
 import asyncio
 from pathlib import Path
 
@@ -26,15 +27,18 @@ MAX_TG_TEXT = 3500
 # Global runtime state
 USER_MODE: dict[int, str] = {}               # preset_slug
 USER_PENDING_TEXT: dict[int, str] = {}       # prompt (preset + details)
-USER_PENDING_FILES: dict[int, list[str]] = {}  # photo file_ids (1-2)
+USER_PENDING_FILES: dict[int, list[str]] = {}  # photo file_ids (1..MAX_INPUT_FILES)
 
 USER_IMAGE_FLOW: dict[int, dict] = {}
 USER_SUNO_FLOW: dict[int, dict] = {}
 USER_GROK_FLOW: dict[int, dict] = {}
 USER_PAY_FLOW: dict[int, dict] = {}
+USER_FEEDBACK_FLOW: dict[int, dict] = {}
 
 ALBUM_PHOTOS: dict[tuple[int, str], list[str]] = {}
 ALBUM_TASKS: dict[tuple[int, str], asyncio.Task] = {}
+
+MAX_FILES_HINT = "файла" if settings.MAX_INPUT_FILES == 1 else "файлов"
 
 
 def _truncate(text: str, limit: int = MAX_TG_TEXT) -> str:
@@ -64,6 +68,22 @@ def _split_chunks(text: str, limit: int = MAX_TG_TEXT) -> list[str]:
     return chunks
 
 
+def _format_wait_timeout() -> str:
+    seconds = int(settings.TASK_TIMEOUT_SEC)
+    if seconds % 60 == 0:
+        minutes = seconds // 60
+        return f"{minutes} мин."
+    return f"{seconds} сек."
+
+
+def _limits_hint() -> str:
+    return (
+        f"Лимиты: до {settings.MAX_INPUT_FILES} {MAX_FILES_HINT}, "
+        f"до {settings.MAX_INPUT_FILE_SIZE_MB} МБ на файл, "
+        f"ожидание до {_format_wait_timeout()}."
+    )
+
+
 async def safe_edit_text(msg: Message, text: str, reply_markup=None):
     text = _truncate(text)
     try:
@@ -89,7 +109,7 @@ def kb_bottom_panel() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="🖼 Изображения")],
             [KeyboardButton(text="🎵 Музыка"), KeyboardButton(text="✍️ Текст")],
-            [KeyboardButton(text="👛 Баланс")],
+            [KeyboardButton(text="🧪 Beta/Feedback")],
         ],
         resize_keyboard=True,
         input_field_placeholder="Выбери раздел…",
@@ -105,7 +125,9 @@ def load_image_presets() -> list[dict]:
 
 
 def _public_file_url(key: str) -> str:
-    base = str(settings.API_PUBLIC_BASE_URL).rstrip("/")
+    base = str(settings.PUBLIC_FILES_BASE_URL).strip().rstrip("/")
+    if not base:
+        return ""
     key = (key or "").lstrip("/")
     return f"{base}/files/{key}"
 
@@ -190,6 +212,38 @@ def _reset_all(uid: int):
     USER_SUNO_FLOW.pop(uid, None)
     USER_GROK_FLOW.pop(uid, None)
     USER_PAY_FLOW.pop(uid, None)
+    USER_FEEDBACK_FLOW.pop(uid, None)
+
+
+def _log_feedback(task_id: int, user_id: int, message: str) -> None:
+    payload = {
+        "event": "feedback",
+        "task_id": task_id,
+        "user_id": user_id,
+        "message": message,
+    }
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+
+def _parse_feedback(text: str) -> tuple[int | None, str]:
+    match = re.search(r"\b(\d+)\b", text)
+    if not match:
+        return None, text.strip()
+    task_id = int(match.group(1))
+    rest = (text[match.end():] or "").strip(" \n\t-—:;")
+    return task_id, rest
+
+
+async def _send_feedback_prompt(message: Message) -> None:
+    await message.answer(
+        "🧪 Beta/Feedback\n\n"
+        "Оплата в бете отключена.\n"
+        "Чтобы оставить фидбек, пришли:\n"
+        "<task_id> <комментарий>\n\n"
+        "Пример: 12345 текст отзыва\n"
+        "Отмена: /cancel",
+        reply_markup=kb_bottom_panel(),
+    )
 
 
 def _build_slug(flow: dict) -> str:
@@ -259,20 +313,32 @@ async def _finalize_album(uid: int, media_group_id: str, message: Message):
         return
 
     if not photos:
-        await message.answer("Не увидел фото. Отправь 1 или 2 фото одним сообщением (альбомом).")
+        await message.answer(
+            f"Не увидел фото. Отправь до {settings.MAX_INPUT_FILES} фото одним сообщением (альбомом).\n"
+            f"{_limits_hint()}"
+        )
         return
 
-    if len(photos) > 2:
-        photos = photos[:2]
-        await message.answer("Принял первые 2 фото, остальные игнорю 🙂", reply_markup=kb_bottom_panel())
+    if len(photos) > settings.MAX_INPUT_FILES:
+        photos = photos[: settings.MAX_INPUT_FILES]
+        await message.answer(
+            f"Принял первые {settings.MAX_INPUT_FILES} фото, остальные игнорю 🙂\n{_limits_hint()}",
+            reply_markup=kb_bottom_panel(),
+        )
 
     USER_PENDING_FILES[uid] = photos
     flow["step"] = "wait_text_edit"
 
     if len(photos) == 1:
-        await message.answer("Фото принято ✅ Теперь напиши промпт (что сделать).", reply_markup=kb_bottom_panel())
+        await message.answer(
+            f"Фото принято ✅ Теперь напиши промпт (что сделать).\n{_limits_hint()}",
+            reply_markup=kb_bottom_panel(),
+        )
     else:
-        await message.answer("2 фото принято ✅ Теперь напиши промпт (что сделать).", reply_markup=kb_bottom_panel())
+        await message.answer(
+            f"{len(photos)} фото принято ✅ Теперь напиши промпт (что сделать).\n{_limits_hint()}",
+            reply_markup=kb_bottom_panel(),
+        )
 
 
 def _file_kind_by_name(filename: str) -> str:
@@ -286,7 +352,7 @@ def _file_kind_by_name(filename: str) -> str:
     return "document"
 
 
-async def _send_file_best_effort(message: Message, data: bytes, filename: str):
+async def _send_file_best_effort(message: Message, data: bytes, filename: str, force_document: bool = False):
     kind = _file_kind_by_name(filename)
 
     # 1) preferred send methods
@@ -300,6 +366,9 @@ async def _send_file_best_effort(message: Message, data: bytes, filename: str):
         if kind == "image":
             # Telegram likes photos, but fallback to document if needed
             try:
+                if force_document:
+                    await message.answer_document(BufferedInputFile(data, filename=filename), reply_markup=kb_bottom_panel())
+                    return
                 await message.answer_photo(BufferedInputFile(data, filename=filename), reply_markup=kb_bottom_panel())
                 return
             except Exception:
@@ -321,6 +390,7 @@ async def _run_and_deliver(message: Message, task_id: int):
     )
 
     task = await wait_task_done(task_id, timeout_sec=1800)
+    preset_slug = task["preset_slug"]
 
     if task["status"] == "success":
         sent_anything = False
@@ -334,18 +404,25 @@ async def _run_and_deliver(message: Message, task_id: int):
                     status_msg,
                     f"✅ Готово! (task #{task_id})\n\nФайл: {filename} ({len(data)/1024/1024:.2f} MB)",
                 )
-                await _send_file_best_effort(message, data, filename)
+                force_document = preset_slug in {"seedvr_x2", "seedvr_x4"}
+                await _send_file_best_effort(message, data, filename, force_document=force_document)
                 sent_anything = True
             except Exception as e:
                 await safe_edit_text(status_msg, f"✅ Готово! (task #{task_id})")
                 pub = _public_file_url(key)
-                await message.answer(
-                    "⚠️ Результат готов, но не смог скачать/отправить файл.\n"
-                    f"Файл: {filename}\n"
-                    f"Причина: {e}\n\n"
-                    f"✅ Ссылка на файл:\n{pub}",
-                    reply_markup=kb_bottom_panel(),
-                )
+                if pub:
+                    await message.answer(
+                        "⚠️ Результат готов, но не смог скачать/отправить файл.\n"
+                        f"Файл: {filename}\n"
+                        f"Причина: {e}\n\n"
+                        f"✅ Ссылка на файл:\n{pub}",
+                        reply_markup=kb_bottom_panel(),
+                    )
+                else:
+                    await message.answer(
+                        "Не смог отправить файл, попробуйте позже",
+                        reply_markup=kb_bottom_panel(),
+                    )
                 sent_anything = True
         else:
             await safe_edit_text(status_msg, f"✅ Готово! (task #{task_id})")
@@ -373,7 +450,12 @@ async def _run_and_deliver(message: Message, task_id: int):
 
 @router.message(F.text == "/start")
 async def start(message: Message):
-    await message.answer("🤖 GenBot\n\nВыбери раздел снизу 👇", reply_markup=kb_bottom_panel())
+    await message.answer(
+        "🤖 GenBot\n\n"
+        "Выбери раздел снизу 👇\n"
+        f"{_limits_hint()}",
+        reply_markup=kb_bottom_panel(),
+    )
 
 
 @router.message(F.text.in_({"/cancel", "Отмена"}))
@@ -418,55 +500,35 @@ async def grok_menu(message: Message):
 
 @router.message(F.text == "👛 Баланс")
 async def balance(message: Message):
-    api = ApiClient()
-    b = await api.get_balance(message.from_user.id)
-    await message.answer(
-        f"👛 Баланс: {b['credits']} кредит(ов)\n\nВыбери сумму пополнения:",
-        reply_markup=kb_payments(),
-    )
+    await _send_feedback_prompt(message)
+
+
+@router.message(F.text.in_({"🧪 Beta/Feedback", "/feedback"}))
+async def feedback_menu(message: Message):
+    uid = message.from_user.id
+    _reset_all(uid)
+    USER_FEEDBACK_FLOW[uid] = {"step": "awaiting"}
+    await _send_feedback_prompt(message)
 
 
 @router.callback_query(F.data == "pay:topup:custom")
 async def cb_pay_custom(cb: CallbackQuery):
-    uid = cb.from_user.id
-    USER_PAY_FLOW[uid] = {"step": "amount"}
     await cb.message.answer(
-        "✍️ Введи сумму пополнения в рублях одним сообщением.\n"
-        "Пример: 550\n\n"
-        "Ограничения: от 10 до 50000 ₽.\n"
-        "Отмена: /cancel",
+        "🧪 Оплата в бете отключена.\n"
+        "Оставь фидбек по задаче, указав task_id и комментарий.",
         reply_markup=kb_bottom_panel(),
     )
-    await cb.answer("Ок")
+    await cb.answer("Бета режим")
 
 
 @router.callback_query(F.data.startswith("pay:topup:") & ~F.data.endswith(":custom"))
 async def cb_topup(cb: CallbackQuery):
-    uid = cb.from_user.id
-    try:
-        amount = int(cb.data.split(":")[-1])
-    except Exception:
-        await cb.answer("Некорректная сумма", show_alert=True)
-        return
-
-    api = ApiClient()
-    try:
-        resp = await api.create_topup(uid, amount_rub=amount, description="Пополнение кредитов GenBot")
-        url = resp.get("confirmation_url")
-        if not url:
-            await cb.answer("Не удалось получить ссылку на оплату", show_alert=True)
-            return
-
-        await cb.message.answer(
-            f"💳 Оплата на {amount} ₽\n\n"
-            f"Ссылка для оплаты:\n{url}\n\n"
-            "Начисление кредитов через вебхук подключим следующим шагом.",
-            reply_markup=kb_bottom_panel(),
-        )
-        await cb.answer("Ссылка готова ✅")
-    except Exception as e:
-        await cb.answer("Ошибка создания платежа", show_alert=True)
-        await cb.message.answer(f"❌ Не смог создать платеж: {e}", reply_markup=kb_bottom_panel())
+    await cb.message.answer(
+        "🧪 Оплата в бете отключена.\n"
+        "Оставь фидбек по задаче, указав task_id и комментарий.",
+        reply_markup=kb_bottom_panel(),
+    )
+    await cb.answer("Бета режим")
 
 
 # ---- Images callbacks & main handler ----
@@ -603,6 +665,7 @@ async def cb_preset(cb: CallbackQuery):
             "✅ Готово.\n\n"
             "Теперь напиши промпт.\n"
             "Если выбрал пресет, можно просто уточнить детали.\n"
+            f"{_limits_hint()}\n"
             "Отмена: /cancel",
         )
     else:
@@ -611,8 +674,9 @@ async def cb_preset(cb: CallbackQuery):
         await safe_edit_text(
             cb.message,
             "✅ Готово.\n\n"
-            "Отправь 1 или 2 фото ОДНИМ сообщением (альбомом).\n"
-            "После этого напиши промпт.\n\n"
+            f"Отправь до {settings.MAX_INPUT_FILES} фото ОДНИМ сообщением (альбомом).\n"
+            "После этого напиши промпт.\n"
+            f"{_limits_hint()}\n\n"
             "Отмена: /cancel",
         )
 
@@ -623,8 +687,23 @@ async def cb_preset(cb: CallbackQuery):
 async def any_message(message: Message):
     uid = message.from_user.id
 
-    panel_buttons = {"🖼 Изображения", "🎵 Музыка", "✍️ Текст", "👛 Баланс"}
+    panel_buttons = {"🖼 Изображения", "🎵 Музыка", "✍️ Текст", "🧪 Beta/Feedback", "👛 Баланс"}
     is_panel_button = message.text in panel_buttons if message.text else False
+
+    feedback_flow = USER_FEEDBACK_FLOW.get(uid)
+    if feedback_flow and feedback_flow.get("step") == "awaiting" and message.text and not message.text.startswith("/"):
+        task_id, feedback_text = _parse_feedback(message.text)
+        if not task_id or not feedback_text:
+            await message.answer(
+                "Нужен формат: <task_id> <комментарий>.\n"
+                "Пример: 12345 текст отзыва",
+                reply_markup=kb_bottom_panel(),
+            )
+            return
+        _log_feedback(task_id=task_id, user_id=uid, message=feedback_text)
+        USER_FEEDBACK_FLOW.pop(uid, None)
+        await message.answer("Спасибо! Фидбек записан ✅", reply_markup=kb_bottom_panel())
+        return
 
     # payment custom
     pf = USER_PAY_FLOW.get(uid)
@@ -730,7 +809,9 @@ async def any_message(message: Message):
     if flow and flow.get("step") == "wait_photos_edit":
         if message.text and not message.text.startswith("/") and not is_panel_button:
             await message.answer(
-                "Сначала отправь 1 или 2 фото одним сообщением (альбомом), потом напиши промпт 🙂\n"
+                f"Сначала отправь до {settings.MAX_INPUT_FILES} фото одним сообщением (альбомом), "
+                "потом напиши промпт 🙂\n"
+                f"{_limits_hint()}\n"
                 "Отмена: /cancel",
                 reply_markup=kb_bottom_panel(),
             )
@@ -747,13 +828,19 @@ async def any_message(message: Message):
                 return
             USER_PENDING_FILES[uid] = [fid]
             flow["step"] = "wait_text_edit"
-            await message.answer("Фото принято ✅ Теперь напиши промпт (что сделать).", reply_markup=kb_bottom_panel())
+            await message.answer(
+                f"Фото принято ✅ Теперь напиши промпт (что сделать).\n{_limits_hint()}",
+                reply_markup=kb_bottom_panel(),
+            )
             return
 
         if message.document:
             USER_PENDING_FILES[uid] = [input_doc_id]
             flow["step"] = "wait_text_edit"
-            await message.answer("Файл принят ✅ Теперь напиши промпт (что сделать).", reply_markup=kb_bottom_panel())
+            await message.answer(
+                f"Файл принят ✅ Теперь напиши промпт (что сделать).\n{_limits_hint()}",
+                reply_markup=kb_bottom_panel(),
+            )
             return
 
         return
@@ -766,7 +853,11 @@ async def any_message(message: Message):
 
             photos = USER_PENDING_FILES.get(uid, [])
             if not photos:
-                await message.answer("Не вижу фото. Отправь 1–2 фото одним сообщением (альбомом).", reply_markup=kb_bottom_panel())
+                await message.answer(
+                    f"Не вижу фото. Отправь до {settings.MAX_INPUT_FILES} фото одним сообщением (альбомом).\n"
+                    f"{_limits_hint()}",
+                    reply_markup=kb_bottom_panel(),
+                )
                 return
 
             meta = flow.get("meta", {})
