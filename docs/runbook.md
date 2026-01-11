@@ -1,5 +1,26 @@
 # Runbook
 
+## Environment setup
+
+1. Скопируйте шаблон `.env.example` в `.env`.
+2. Заполните обязательные переменные в `.env`:
+   - `BOT_TOKEN`
+   - `GENAPI_TOKEN`
+   - `DATABASE_URL_ASYNC`
+   - `DATABASE_URL_SYNC`
+   - `INTERNAL_API_KEY`
+3. При необходимости настройте интеграции:
+   - MinIO: `MINIO_ENDPOINT`, `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY`, `MINIO_BUCKET`, `MINIO_SECURE`
+   - YooKassa: `YOOKASSA_SHOP_ID`, `YOOKASSA_SECRET_KEY`, `YOOKASSA_RETURN_URL`, `YOOKASSA_WEBHOOK_SECRET`
+
+## Automated smoke checks
+
+Перед деплоем выполните:
+
+```bash
+python -m app.tools.smoke_check
+```
+
 ## Smoke tests
 
 1. **Создание задач (text/image/suno).**

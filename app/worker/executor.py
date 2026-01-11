@@ -5,6 +5,7 @@ import mimetypes
 import json
 import time
 import random
+import logging
 
 import httpx
 from sqlalchemy import select, update
@@ -16,6 +17,30 @@ from app.genapi.client import GenApiClient
 from app.presets.registry import get_preset
 from app.storage.local import save_bytes
 from app.worker.telegram_files import tg_download_file
+
+
+def _log_task_event(
+    *,
+    event: str,
+    task_id: int,
+    preset: str,
+    file_url: str | None,
+    result_file_key: str | None,
+    error_message: str | None,
+) -> None:
+    logger = logging.getLogger("task_events")
+    try:
+        payload = {
+            "event": event,
+            "task_id": task_id,
+            "preset": preset,
+            "file_url": file_url,
+            "result_file_key": result_file_key,
+            "error_message": error_message,
+        }
+        logger.info("task_event=%s", json.dumps(payload, ensure_ascii=False))
+    except Exception:
+        logging.getLogger(__name__).warning("Failed to log task event", exc_info=True)
 
 
 def _guess_mime(filename: str) -> str:
