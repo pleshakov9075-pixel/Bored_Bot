@@ -147,11 +147,34 @@ def _grok_extract_text(payload: dict) -> str | None:
     return None
 
 
+def _input_size_limit_bytes() -> int:
+    return int(settings.MAX_INPUT_FILE_SIZE_MB) * 1024 * 1024
+
+
+def _ensure_file_size(filename: str, content: bytes) -> None:
+    limit = _input_size_limit_bytes()
+    size = len(content or b"")
+    if size > limit:
+        raise RuntimeError(
+            f"Слишком большой файл {filename} ({size / 1024 / 1024:.2f} МБ). "
+            f"Лимит {settings.MAX_INPUT_FILE_SIZE_MB} МБ."
+        )
+
+
+def _ensure_file_count(count: int) -> None:
+    if count > settings.MAX_INPUT_FILES:
+        raise RuntimeError(f"Слишком много файлов: максимум {settings.MAX_INPUT_FILES}.")
+
+
 def execute_task(task_id: int) -> None:
     db = SessionLocal()
+    file_url_for_log: str | None = None
+    result_file_key_for_log: str | None = None
+    preset_slug = ""
     try:
         task = db.execute(select(Task).where(Task.id == task_id)).scalar_one()
-        preset = get_preset((task.preset_slug or "").strip().lower())
+        preset_slug = (task.preset_slug or "").strip().lower()
+        preset = get_preset(preset_slug)
 
         db.execute(
             update(Task)
@@ -167,7 +190,11 @@ def execute_task(task_id: int) -> None:
         if not settings.GENAPI_TOKEN:
             raise RuntimeError("GENAPI_TOKEN is empty in .env")
 
-        gen = GenApiClient(settings.GENAPI_BASE_URL, settings.GENAPI_TOKEN)
+        gen = GenApiClient(
+            settings.GENAPI_BASE_URL,
+            settings.GENAPI_TOKEN,
+            poll_timeout_sec=settings.TASK_TIMEOUT_SEC,
+        )
 
         params: dict = dict(preset.params or {})
         prompt_text, meta = _parse_text_and_meta(task.input_text)
@@ -223,6 +250,7 @@ def execute_task(task_id: int) -> None:
             if not task.input_tg_file_id:
                 raise RuntimeError("No input file. Send image/audio file.")
             filename, content = tg_download_file(settings.BOT_TOKEN, task.input_tg_file_id)
+            _ensure_file_size(filename, content)
             mime = _guess_mime(filename)
 
         # ---- run ----
@@ -250,10 +278,13 @@ def execute_task(task_id: int) -> None:
                         raise RuntimeError("No input file. Send image file.")
                     tg_file_ids = [task.input_tg_file_id]
 
+                _ensure_file_count(len(tg_file_ids))
+
                 public_base = str(settings.API_PUBLIC_BASE_URL).rstrip("/")
                 urls: list[str] = []
                 for idx, fid in enumerate(tg_file_ids, start=1):
                     fn, body = tg_download_file(settings.BOT_TOKEN, fid)
+                    _ensure_file_size(fn, body)
                     ext = _ext_from_filename(fn)
                     input_key = f"uploads/task_{task_id}_{preset.slug}_{idx}{ext}"
                     save_bytes(input_key, body)
@@ -266,7 +297,14 @@ def execute_task(task_id: int) -> None:
                     params[preset.input_field] = urls[0]
 
             params["translate_input"] = False
-            print(f"[task {task_id}] preset={preset.slug} network={preset.provider_id} params={params}")
+            _log_task_event(
+                event="submit_network",
+                task_id=task_id,
+                preset=preset.slug,
+                file_url=None,
+                result_file_key=None,
+                error_message=None,
+            )
 
             request_id = gen.submit_network(
                 network_id=preset.provider_id,
@@ -278,7 +316,7 @@ def execute_task(task_id: int) -> None:
             raise RuntimeError(f"Unsupported provider_target={preset.provider_target}")
 
         # ---- poll ----
-        result = gen.poll(request_id, timeout_sec=900)
+        result = gen.poll(request_id, timeout_sec=settings.TASK_TIMEOUT_SEC)
         if result.status != "success":
             raise RuntimeError(f"GenAPI failed: {result.payload}")
 
@@ -299,6 +337,7 @@ def execute_task(task_id: int) -> None:
         # ✅ SeedVR / general: если extractor промахнулся, выберем лучший url по расширению
         if not file_url and all_urls:
             file_url = _pick_best_url(all_urls)
+        file_url_for_log = file_url
 
         # ---- store result ----
         if file_url:
@@ -313,6 +352,7 @@ def execute_task(task_id: int) -> None:
 
             key = f"results/task_{task_id}_{preset.slug}{ext}"
             save_bytes(key, out_bytes)
+            result_file_key_for_log = key
 
             db.execute(
                 update(Task)
@@ -337,18 +377,35 @@ def execute_task(task_id: int) -> None:
                 )
             )
             db.commit()
+        _log_task_event(
+            event="task_success",
+            task_id=task_id,
+            preset=preset.slug,
+            file_url=file_url_for_log,
+            result_file_key=result_file_key_for_log,
+            error_message=None,
+        )
 
     except Exception as e:
+        error_message = str(e)
         db.rollback()
         db.execute(
             update(Task)
             .where(Task.id == task_id)
             .values(
                 status=TaskStatus.failed,
-                error_message=str(e),
+                error_message=error_message,
                 updated_at=datetime.now(UTC),
             )
         )
         db.commit()
+        _log_task_event(
+            event="task_failed",
+            task_id=task_id,
+            preset=preset_slug or "unknown",
+            file_url=file_url_for_log,
+            result_file_key=result_file_key_for_log,
+            error_message=error_message,
+        )
     finally:
         db.close()

@@ -1,9 +1,12 @@
 ﻿import asyncio
+
 from app.bot.api_client import ApiClient
+from app.core.config import settings
 
 
-async def wait_task_done(task_id: int, timeout_sec: int = 90) -> dict:
+async def wait_task_done(task_id: int, timeout_sec: int | None = None) -> dict:
     api = ApiClient()
+    timeout_sec = timeout_sec or settings.TASK_TIMEOUT_SEC
     deadline = asyncio.get_event_loop().time() + timeout_sec
     delay = 1.0
 

@@ -104,6 +104,7 @@ def get_task(task_id: int, x_api_key: str | None = Header(default=None)):
         return {
             "task_id": task.id,
             "status": task.status,
+            "preset_slug": task.preset_slug,
             "result_file_key": task.result_file_key,
             "result_text": task.result_text,
             "error_message": task.error_message,
